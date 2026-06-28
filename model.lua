@@ -198,10 +198,9 @@ if SERVER then
         if networking then return end
         networking = true
         timer.simple(0, function()
-            if ply and !isValid(ply) then return end
             net.start("NetworkModels")
                 net.writeTable(model.toNetwork)
-            net.send(ply or find.allPlayers())
+            net.send(find.allPlayers())
             networking = false
         end)
     end
@@ -428,9 +427,9 @@ function model.rig(pos, ang)
     end
 end
 
-local cylinder = {}
-
 local polygons = 32
+
+local cylinder = {}
 for i=1,polygons do
     local ang = math.rad((360 / polygons) * i)
     local x = math.cos(ang)
@@ -746,16 +745,16 @@ end
 ---[SHARED] Add sequence info to model
 ---@param name string Identifier of sequence
 ---@param duration number Duration of sequence
----@param startFun fun(ent: ModelEntity) Start function
----@param processFun fun(ent: ModelEntity, process: number) Sequence process
----@param endFun fun(ent: ModelEntity) End function
+---@param startFun fun(ent: ModelEntity)? Start function
+---@param processFun fun(ent: ModelEntity, process: number)? Sequence process
+---@param endFun fun(ent: ModelEntity)? End function
 ---@return ModelInfo
 function ModelInfo:addSequence(name, duration, startFun, processFun, endFun)
     local id = #self.sequences+1
     self.sequences[id] = {
-        startFun = startFun,
-        processFun = processFun,
-        endFun = endFun,
+        startFun = startFun or emptyFunction,
+        processFun = processFun or emptyFunction,
+        endFun = endFun or emptyFunction,
         duration = duration,
         name = name
     }
