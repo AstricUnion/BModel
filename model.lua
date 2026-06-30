@@ -57,17 +57,17 @@ local function methodsOverride(ent)
     ent.__lookupBoneOld = ent.__lookupBoneOld or ent.lookupBone
     ---[SHARED] Lookup for bone in entity
     ---@param name string Name of the bone
-    ---@return number? id
+    ---@return number id
     function ent:lookupBone(name)
-        return ent.modelInfo.bonesIDs[name]
+        return ent.modelInfo.bonesIDs[name] or -1
     end
 
     ent.__lookupSequenceOld = ent.__lookupSequenceOld or ent.lookupSequence
     ---[SHARED] Lookup for sequence in entity
     ---@param name string Name of the sequence
-    ---@return number? id
+    ---@return number id
     function ent:lookupSequence(name)
-        return ent.modelInfo.sequencesIDs[name]
+        return ent.modelInfo.sequencesIDs[name] or -1
     end
 
     ent.__getSequenceOld = ent.__getSequenceOld or ent.getSequence
