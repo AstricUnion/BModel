@@ -2,6 +2,41 @@
 ---@author AstricUnion
 
 
+-- implement client parents for holograms
+if CLIENT then
+    local setParent = function(self, par)
+        if self.parent then
+            self.parent.children[self] = nil
+            self.parent = nil
+        end
+        if par then
+            par.children = par.children or {}
+            par.children[self] = self
+            self.parent = par
+            self:__setParentOld(par)
+        else
+            self:__setParentOld(nil)
+        end
+    end
+
+    local getChildren = function(self)
+        return self.children
+    end
+
+    hologram.__createOld = hologram.__createOld or hologram.create
+    function hologram.create(...)
+        local holo = hologram.__createOld(...)
+        if !holo then return end
+        holo.children = {}
+        holo.__setParentOld = holo.__setParentOld or holo.setParent
+        holo.setParent = setParent
+        holo.__getChildrenOld = holo.__getChildrenOld or holo.getChildren
+        holo.getChildren = getChildren
+        return holo
+    end
+end
+
+
 ---@class ToNetwork
 ---@field modelId string Identifier of model
 ---@field params table[] Parameters to set (functions to call)
@@ -33,13 +68,43 @@ model.rigVisible = false
 local function methodsOverride(ent)
     ---@class ModelEntity
     local ent = ent
+
+    local function recursiveFun(origin, fun, ...)
+        for _, v in pairs(origin.modelBones or origin:getChildren()) do
+            if isfunction(fun) then
+                fun(v, ...)
+            else
+                if v[fun] then v[fun](v, ...) end
+            end
+            recursiveFun(v, fun, ...)
+        end
+    end
+
+    local entId = ent:entIndex()
+    local networking = false
+    local function sendFunction(func, ...)
+        if !SERVER or !ent.modelBones then return end
+        local args = {...}
+        local toNetwork = model.toNetwork[entId]
+        if !toNetwork then return end
+        toNetwork.params[#toNetwork.params+1] = {func, args}
+        if networking then return end
+        networking = true
+        timer.simple(0, function()
+            if !isValid(ent) then return end
+            net.start("ModelCallFunctions")
+                net.writeTable(toNetwork.params)
+                net.writeEntity(ent)
+            net.send(find.allPlayers())
+            networking = false
+        end)
+    end
     -- I can use ent, not self, because this is method only for this entity
     ent.__setNoDrawOld = ent.__setNoDrawOld or ent.setNoDraw
     function ent:setNoDraw(state)
         ent.noDraw = state
-        for _, v in pairs(ent:getChildren()) do
-            v:setNoDraw(state)
-        end
+        sendFunction("setNoDraw", state)
+        recursiveFun(ent, "setNoDraw", state)
     end
 
     ent.__getNoDrawOld = ent.__getNoDrawOld or ent.getNoDraw
@@ -75,37 +140,6 @@ local function methodsOverride(ent)
     ---@return number id
     function ent:getSequence()
         return ent.sequence or 0
-    end
-
-    local function recursiveFun(origin, fun, ...)
-        for _, v in pairs(origin:getChildren()) do
-            if isfunction(fun) then
-                fun(v, ...)
-            else
-                if v[fun] then v[fun](v, ...) end
-            end
-            recursiveFun(v, fun, ...)
-        end
-    end
-
-    local entId = ent:entIndex()
-    local networking = false
-    local function sendFunction(func, ...)
-        if !SERVER or !ent.modelBones then return end
-        local args = {...}
-        local toNetwork = model.toNetwork[entId]
-        if !toNetwork then return end
-        toNetwork.params[#toNetwork.params+1] = {func, args}
-        if networking then return end
-        networking = true
-        timer.simple(0, function()
-            if !isValid(ent) then return end
-            net.start("ModelCallFunctions")
-                net.writeTable(toNetwork.params)
-                net.writeEntity(ent)
-            net.send(find.allPlayers())
-            networking = false
-        end)
     end
 
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
@@ -162,6 +196,14 @@ local function methodsOverride(ent)
     function ent:setColor(col)
         sendFunction("setColor", col)
         recursiveFun(ent, "setColor", col)
+    end
+
+    ent.__setRenderFXOld = ent.__setRenderFXOld or ent.setRenderFX
+    ---[SHARED] Set render FX for this model
+    ---@param renderFx number Render FX. RENDERFX enum
+    function ent:setRenderFX(renderFx)
+        sendFunction("setRenderFX", renderFx)
+        recursiveFun(ent, "setRenderFX", renderFx)
     end
 
     if CLIENT then
