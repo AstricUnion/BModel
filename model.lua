@@ -39,7 +39,8 @@ end
 
 ---@class ToNetwork
 ---@field modelId string Identifier of model
----@field params table[] Parameters to set (functions to call)
+---@field params table[] Global parameters to set (functions to call)
+---@field paramsToSend table[] Parameters to set to send at this moment
 
 ---Class to manipulate hologram models with custom meshes and hitboxes
 ---@class model
@@ -87,15 +88,20 @@ local function methodsOverride(ent)
         local args = {...}
         local toNetwork = model.toNetwork[entId]
         if !toNetwork then return end
-        toNetwork.params[#toNetwork.params+1] = {func, args}
+        local params = toNetwork.paramsToSend
+        local globalParams = toNetwork.params
+        local tab = {func, args}
+        params[#params+1] = tab
+        globalParams[#globalParams+1] = tab
         if networking then return end
         networking = true
         timer.simple(0, function()
             if !isValid(ent) then return end
             net.start("ModelCallFunctions")
-                net.writeTable(toNetwork.params)
+                net.writeTable(params)
                 net.writeEntity(ent)
             net.send(find.allPlayers())
+            table.empty(params)
             networking = false
         end)
     end
@@ -825,7 +831,8 @@ function ModelInfo:create(origin)
     if SERVER then
         model.toNetwork[id] = {
             modelId = self.identifier,
-            params = {}
+            params = {},
+            paramsToSend = {}
         }
         model.sync()
         originHolo = methodsOverride(originHolo)
