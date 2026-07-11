@@ -68,19 +68,22 @@ local function boneMethodsOverride(ent)
     local ent = ent
 
     if CLIENT then
+        ent.layers = {}
+
         ---[CLIENT] Set local to parent position for layer for animations
         ---@param layer number Layer to set
         ---@param pos Vector Position to set
         function ent:setLocalPosLayer(layer, pos)
             local layerData = ent.layers[layer]
+            local currentOffset = ent:getLocalPos()
             if !layerData then
                 ent.layers[layer] = {
                     offset = pos,
                     angle = Angle()
                 }
+                ent:setLocalPos(currentOffset + pos)
                 return
             end
-            -- TODO: optimize with delta
             layerData.offset = pos
             local offset = Vector()
             for _, v in pairs(ent.layers) do
@@ -89,33 +92,34 @@ local function boneMethodsOverride(ent)
             ent:setLocalPos(offset)
         end
 
-        ---[CLIENT] Get local to parent position for layer
-        ---@param layer number Layer to get
-        ---@return Vector pos Layer position
-        function ent:getLocalPosLayer(layer)
-            local layerData = ent.layers[layer]
-            return layerData and layerData.offset or Vector()
-        end
-
         ---[CLIENT] Set local to parent angles for layer for animations
         ---@param layer number Layer to set
         ---@param angs Angle Angles to set
         function ent:setLocalAnglesLayer(layer, angs)
             local layerData = ent.layers[layer]
+            local currentAngles = ent:getLocalAngles()
             if !layerData then
                 ent.layers[layer] = {
                     offset = Vector(),
                     angle = angs
                 }
                 return
+                ent:setLocalAngles(currentAngles + angs)
             end
-            -- TODO: optimize with delta
             layerData.angle = angs
             local angle = Angle()
             for _, v in pairs(ent.layers) do
                 angle = angle + v.angle
             end
             ent:setLocalAngles(angle)
+        end
+
+        ---[CLIENT] Get local to parent position for layer
+        ---@param layer number Layer to get
+        ---@return Vector pos Layer position
+        function ent:getLocalPosLayer(layer)
+            local layerData = ent.layers[layer]
+            return layerData and layerData.offset or Vector()
         end
 
         ---[CLIENT] Get local to parent angles for layer
@@ -313,7 +317,7 @@ local function modelMethodsOverride(ent)
 
         ---[CLIENT] Get entity of the bone
         ---@param id number Index of the bone
-        ---@return Entity?
+        ---@return BoneEntity?
         function ent:getBoneEntity(id)
             return ent.modelBones[id]
         end
@@ -505,6 +509,7 @@ else
                     v.sequences[layer] = nil
                     goto cont
                 end
+                ::cont::
             end
             ::cont::
         end
@@ -887,7 +892,7 @@ end
 ---[SHARED] Add sequence info to model
 ---@param name string Identifier of sequence
 ---@param duration number Duration of sequence
----@param startFun fun(ent: ModelEntity) Start function
+---@param startFun fun(ent: ModelEntity, layer: number): fun(process: number): boolean Start function
 ---@return ModelInfo
 function ModelInfo:addSequence(name, duration, startFun)
     local id = #self.sequences+1
