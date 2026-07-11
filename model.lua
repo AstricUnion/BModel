@@ -237,7 +237,7 @@ local function modelMethodsOverride(ent)
     ---[SHARED] Returns current entity sequence
     ---@return number id
     function ent:getSequence()
-        return ent.sequence or 0
+        return ent.sequences[0].id or 0
     end
 
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
