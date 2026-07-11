@@ -63,10 +63,98 @@ model.rigVisible = false
 
 ---@alias modelfun fun(): (Entity?)
 
+local function boneMethodsOverride(ent)
+    ---@class BoneEntity
+    local ent = ent
+
+    if CLIENT then
+        ---[CLIENT] Set local to parent position for layer for animations
+        ---@param layer number Layer to set
+        ---@param pos Vector Position to set
+        function ent:setLocalPosLayer(layer, pos)
+            local layerData = ent.layers[layer]
+            if !layerData then
+                ent.layers[layer] = {
+                    offset = pos,
+                    angle = Angle()
+                }
+                return
+            end
+            -- TODO: optimize with delta
+            layerData.offset = pos
+            local offset = Vector()
+            for _, v in pairs(ent.layers) do
+                offset = offset + v.offset
+            end
+            ent:setLocalPos(offset)
+        end
+
+        ---[CLIENT] Get local to parent position for layer
+        ---@param layer number Layer to get
+        ---@return Vector pos Layer position
+        function ent:getLocalPosLayer(layer)
+            local layerData = ent.layers[layer]
+            return layerData and layerData.offset or Vector()
+        end
+
+        ---[CLIENT] Set local to parent angles for layer for animations
+        ---@param layer number Layer to set
+        ---@param angs Angle Angles to set
+        function ent:setLocalAnglesLayer(layer, angs)
+            local layerData = ent.layers[layer]
+            if !layerData then
+                ent.layers[layer] = {
+                    offset = Vector(),
+                    angle = angs
+                }
+                return
+            end
+            -- TODO: optimize with delta
+            layerData.angle = angs
+            local angle = Angle()
+            for _, v in pairs(ent.layers) do
+                angle = angle + v.angle
+            end
+            ent:setLocalAngles(angle)
+        end
+
+        ---[CLIENT] Get local to parent angles for layer
+        ---@param layer number Layer to get
+        ---@return Angle angles Layer angles
+        function ent:getLocalAnglesLayer(layer)
+            local layerData = ent.layers[layer]
+            return layerData and layerData.angle or Angle()
+        end
+
+        ---[CLIENT] Get properties for layer (for tween lib)
+        ---@param layer number Layer to get
+        ---@return ParamProperty pos Layer position property
+        ---@return ParamProperty angles Layer angles property
+        function ent:getPropertyForLayer(layer)
+            return {
+                set = function(propEnt, toSet)
+                    propEnt:setLocalPosLayer(layer, toSet)
+                end,
+                get = function(propEnt)
+                    return propEnt:getLocalPosLayer(layer)
+                end
+            }, {
+                set = function(propEnt, toSet)
+                    propEnt:setLocalAnglesLayer(layer, toSet)
+                end,
+                get = function(propEnt)
+                    return propEnt:getLocalAnglesLayer(layer)
+                end
+            }
+        end
+    end
+end
+
+
 ---Override methods of entity to work with models
 ---@param ent Entity
 ---@return ModelEntity
-local function methodsOverride(ent)
+local function modelMethodsOverride(ent)
     ---@class ModelEntity
     local ent = ent
 
@@ -151,15 +239,20 @@ local function methodsOverride(ent)
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
     ---[SHARED] Set sequence for this entity
     ---@param id number Sequence ID
-    function ent:setSequence(id)
-        sendFunction("setSequence", id)
+    ---@param layerId number? Sequence layer ID. 0 is default
+    function ent:setSequence(id, layerId)
+        layerId = layerId or 0
+        sendFunction("setSequence", id, layerId)
         if CLIENT then
             local seq = ent.modelInfo.sequences[id]
             if !seq then return end
-            ent.sequence = id
-            seq.startFun(ent)
-            if seq.duration <= 0 then return end
-            ent.sequenceStart = timer.curtime()
+            local sequence = {}
+            ent.sequences[layerId] = sequence
+            local process = seq.startFun(ent, layerId)
+            sequence.id = id
+            sequence.start = timer.curtime()
+            sequence.process = process
+            sequence.duration = seq.duration
         end
     end
 
@@ -337,7 +430,7 @@ else
             local mdl = model.registered[toNetworkInfo.modelId]
             if !mdl then goto cont end
             mdl:create(ent)
-            methodsOverride(ent)
+            modelMethodsOverride(ent)
             for _, funcTable in ipairs(toNetworkInfo.params) do
                 if !ent[funcTable[1]] then goto cont end
                 ent[funcTable[1]](ent, unpack(funcTable[2]))
@@ -400,15 +493,18 @@ else
         local cur = timer.curtime()
         for _, v in pairs(model.inited) do
             if !isValid(v) then goto cont end
-            if v.sequenceStart then
-                local process = cur - v.sequenceStart
-                local seq = v.modelInfo.sequences[v.sequence]
-                if process > seq.duration then
-                    seq.endFun(v)
-                    v.sequenceStart = nil
+            for layer, sequence in pairs(v.sequences) do
+                local process = cur - sequence.start
+                local duration = sequence.duration
+                local ended = sequence.process(process)
+                if duration == 0 then
+                    if ended then sequence.start = timer.curtime() end
                     goto cont
                 end
-                seq.processFun(v, process)
+                if process > duration then
+                    v.sequences[layer] = nil
+                    goto cont
+                end
             end
             ::cont::
         end
@@ -747,9 +843,7 @@ end
 
 ---@class ModelSequence
 ---@field name string
----@field startFun fun(ent: ModelEntity)
----@field processFun fun(ent: ModelEntity, delta: number)
----@field endFun fun(ent: ModelEntity)
+---@field startFun fun(ent: ModelEntity, layer: number): fun(process: number): boolean
 ---@field duration number
 
 ---@class ModelInfo
@@ -793,16 +887,12 @@ end
 ---[SHARED] Add sequence info to model
 ---@param name string Identifier of sequence
 ---@param duration number Duration of sequence
----@param startFun fun(ent: ModelEntity)? Start function
----@param processFun fun(ent: ModelEntity, process: number)? Sequence process
----@param endFun fun(ent: ModelEntity)? End function
+---@param startFun fun(ent: ModelEntity) Start function
 ---@return ModelInfo
-function ModelInfo:addSequence(name, duration, startFun, processFun, endFun)
+function ModelInfo:addSequence(name, duration, startFun)
     local id = #self.sequences+1
     self.sequences[id] = {
-        startFun = startFun or emptyFunction,
-        processFun = processFun or emptyFunction,
-        endFun = endFun or emptyFunction,
+        startFun = startFun,
         duration = duration,
         name = name
     }
@@ -810,13 +900,25 @@ function ModelInfo:addSequence(name, duration, startFun, processFun, endFun)
     return self
 end
 
+---@class Sequence
+---@field id number ID of sequence to start
+---@field start number Relative to curtime
+---@field duration number Duration of sequence
+---@field process fun(process: number): boolean Relative to curtime
 
 ---@class ModelEntity: Entity
 ---@field identifier string Identifier of model
 ---@field modelInfo ModelInfo Model info
----@field modelBones Entity[] [CLIENT] Model bones entities, by number
----@field sequence number Current sequence ID
----@field sequenceStart number Relative to curtime
+---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
+---@field sequences table<number, Sequence> Layers of sequences
+
+---@class Layer
+---@field offset Vector
+---@field angle Angle
+
+---@class BoneEntity: Entity
+---@field identifier string Identifier of bone
+---@field layers table<number, Layer> Animation layers
 
 
 ---@param origin Entity? Origin to parent
@@ -835,11 +937,11 @@ function ModelInfo:create(origin)
             paramsToSend = {}
         }
         model.sync()
-        originHolo = methodsOverride(originHolo)
+        originHolo = modelMethodsOverride(originHolo)
         originHolo.identifier = self.identifier
         originHolo.modelBones = {}
         originHolo.modelInfo = self
-        originHolo.sequence = 0
+        originHolo.sequences = {}
         model.inited[id] = originHolo
         return originHolo
     end
@@ -849,6 +951,7 @@ function ModelInfo:create(origin)
         if !part then goto cont end
         local holo = part.bone()
         if !holo then goto cont end
+        boneMethodsOverride(holo)
         bones[i] = holo
         local parent = part.parent
         local parentHolo = bones[self.bonesIDs[parent]] or (!parent and originHolo)
@@ -862,11 +965,12 @@ function ModelInfo:create(origin)
         holo:setParent(parentHolo)
         ::cont::
     end
-    originHolo = methodsOverride(originHolo)
+    -- i will remove repeating code, i promise
+    originHolo = modelMethodsOverride(originHolo)
     originHolo.identifier = self.identifier
     originHolo.modelBones = bones
     originHolo.modelInfo = self
-    originHolo.sequence = 0
+    originHolo.sequences = {}
     model.inited[id] = originHolo
     return originHolo
 end
