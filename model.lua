@@ -154,6 +154,37 @@ local function boneMethodsOverride(ent)
     end
 end
 
+local function vectorToPrefixed(prefix, vec)
+    return string.format("\n%s %s %s %s", prefix, vec.x, vec.y, vec.z)
+end
+
+local function objFromModel(mdl, offset, angle, scale, numOffset)
+    scale = scale
+    local msh = mesh.getModelMeshes(mdl)
+    if !msh then return end
+    local vertexes = ""
+    local normals = ""
+    local faces = ""
+    local verticies = msh[1].triangles
+    local function getIndex(id)
+        local v = verticies[id]
+        if !v then return end
+        vertexes = vertexes .. vectorToPrefixed("v", localToWorld(v.pos * scale, Angle(), offset, angle) / 39.37008)
+        normals = normals .. vectorToPrefixed("vn", v.normal)
+        return id
+    end
+    local numVert = #verticies
+    for i=1, numVert, 3 do
+        local v1i = getIndex(i)
+        local v2i = getIndex(i+1)
+        local v3i = getIndex(i+2)
+        if !(v1i and v2i and v3i) then goto cont end
+        faces = faces .. vectorToPrefixed("f", Vector(v1i + numOffset, v2i + numOffset, v3i + numOffset))
+        ::cont::
+    end
+    return vertexes, normals, faces, numVert
+end
+
 
 ---Override methods of entity to work with models
 ---@param ent Entity
@@ -320,6 +351,39 @@ local function modelMethodsOverride(ent)
         ---@return BoneEntity?
         function ent:getBoneEntity(id)
             return ent.modelBones[id]
+        end
+
+        ---[CLIENT] Get OBJ with rig for Blender
+        ---@return string mdlData
+        function ent:getObj()
+            local objData = ""
+            local boneString = ""
+            local offset = 0
+            local originPos, originAng = ent:getPos(), ent:getAngles()
+            local boneInfos = self.modelInfo.bones
+            for i, v in ipairs(self.modelBones) do
+                local vertexesGl = ""
+                local normalsGl = ""
+                local facesGl = ""
+                for _, child in pairs(v:getChildren()) do
+                    if child == v then goto cont end
+                    local pos, ang = worldToLocal(child:getPos(), child:getAngles(), originPos, originAng)
+                    local vertexes, normals, faces, num = objFromModel(child:getModel(), pos, ang, child:getScale(), offset)
+                    offset = offset + num
+                    vertexesGl = vertexesGl .. vertexes
+                    normalsGl = normalsGl .. normals
+                    facesGl = facesGl .. faces
+                    ::cont::
+                end
+                local boneInfo = boneInfos[i]
+                local name = boneInfo.name
+                objData = objData .. "o " .. name .. vertexesGl .. normalsGl .. facesGl .. "\n"
+                local parentName = boneInfo.parent
+                local pos = v:getPos() / 39.37008
+                local ang = v:getAngles()
+                boneString = boneString .. string.format("#%s;%s,%s,%s;%s,%s,%s;%s\n", name, pos.x, pos.y, pos.z, ang.p, ang.y, ang.r, parentName)
+            end
+            return boneString .. "\n" .. objData
         end
     end
 
@@ -807,7 +871,9 @@ function model.holo(tbl)
             holo:setSubMaterial(index, matToSet)
         end
         if isstring(matName) then
-            funcToMat = function(holo) setMaterial(holo, 0, matName) end
+            funcToMat = function(holo)
+                setMaterial(holo, 0, matName)
+            end
         elseif istable(matName) then
             funcToMat = function(holo)
                 ---@cast matName table<number, string>
@@ -1005,3 +1071,4 @@ end
 
 
 return model
+
