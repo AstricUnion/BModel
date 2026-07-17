@@ -1,6 +1,18 @@
 ---@name Model
 ---@author AstricUnion
 
+---@class Sequence
+---@field id number ID of sequence to start
+---@field start number Relative to curtime
+---@field duration number Duration of sequence
+---@field process fun(process: number): boolean Relative to curtime
+
+---@class ModelEntity: Entity
+---@field identifier string Identifier of model
+---@field modelInfo ModelInfo Model info
+---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
+---@field sequences table<number, Sequence> [CLIENT] Layers of sequences
+---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
 
 -- implement client parents for holograms
 if CLIENT then
@@ -69,6 +81,7 @@ local function boneMethodsOverride(ent)
 
     if CLIENT then
         ent.layers = {}
+        ent.offset = ent:getLocalPos()
 
         ---[CLIENT] Set local to parent position for layer for animations
         ---@param layer number Layer to set
@@ -89,7 +102,7 @@ local function boneMethodsOverride(ent)
             for _, v in pairs(ent.layers) do
                 offset = offset + v.offset
             end
-            ent:setLocalPos(offset)
+            ent:setLocalPos(ent.offset + offset)
         end
 
         ---[CLIENT] Set local to parent angles for layer for animations
@@ -288,6 +301,27 @@ local function modelMethodsOverride(ent)
             sequence.start = timer.curtime()
             sequence.process = process
             sequence.duration = seq.duration
+        end
+    end
+
+    ent.__getPoseParameterOld = ent.__getPoseParameterOld or ent.getPoseParameter
+    ---[SHARED] Returns current entity pose parameter
+    ---@param name string Name of pose parameter
+    ---@return number value
+    function ent:getPoseParameter(name)
+        return ent.poseParameters[name] or 0
+    end
+
+    ent.__setPoseParameterOld = ent.__setPoseParameterOld or ent.setPoseParameter
+    ---[SHARED] Set pose parameter for this entity
+    ---@param name string Name of pose parameter
+    ---@param value number Value to set
+    function ent:setPoseParameter(name, value)
+        sendFunction("setPoseParameter", name, value)
+        if CLIENT then
+            local param = ent.modelInfo.poseParameters[name]
+            if !param then return end
+            ent.poseParameters[name] = math.clamp(value, param.min, param.max)
         end
     end
 
@@ -790,6 +824,24 @@ if SERVER then
 end
 
 
+model.partsHolos = {}
+local partCreateHolosCoroutine = coroutine.wrap(function(...)
+    while true do
+        coroutine.yield()
+        for _, v in ipairs(model.partsHolos) do
+            coroutine.yield()
+            local holo = v[1]()
+            local offset = holo:getLocalPos()
+            local ang = holo:getLocalAngles()
+            holo:setParent(v[2])
+            holo:setLocalPos(offset)
+            holo:setLocalAngles(ang)
+        end
+        model.partsHolos = {}
+    end
+end)
+hook.add("Think", "PartCreateHolos", partCreateHolosCoroutine)
+
 
 ---[SHARED] Create new part - sequence of holos, parented to first in sequence
 ---@param tbl modelfun[]
@@ -797,26 +849,13 @@ end
 function model.part(tbl)
     return function()
         local parent
-        local toRemove = {}
         for _, fn in ipairs(tbl) do
             if !parent then
                 parent = fn()
                 goto cont
             end
-            local holo = fn()
-            if !holo then goto cont end
-            holo:setParent(parent)
-            toRemove[#toRemove+1] = holo
+            model.partsHolos[#model.partsHolos+1] = {fn, parent}
             ::cont::
-        end
-        if CLIENT and parent then
-            parent.__removeOld = parent.__removeOld or parent.remove
-            function parent:remove()
-                self:__removeOld()
-                for _, v in ipairs(toRemove) do
-                    v:remove()
-                end
-            end
         end
         return parent
     end
@@ -917,16 +956,36 @@ end
 ---@field startFun fun(ent: ModelEntity, layer: number): fun(process: number): boolean
 ---@field duration number
 
+---@class PoseParameter
+---@field name string
+---@field min number
+---@field max number
+
 ---@class ModelInfo
 ---@field origin fun()
 ---@field bones Bone[]
 ---@field bonesIDs table<string, number>
 ---@field sequences ModelSequence[]
 ---@field sequencesIDs table<string, number>
+---@field poseParameters table<string, PoseParameter>
 ---@field identifier string
 local ModelInfo = {}
 ModelInfo.__index = ModelInfo
 
+
+---[SHARED] Create new model info
+---@param identifier string Identifier of model
+---@param origin Vector|modelfun Origin of this entity
+---@return ModelInfo
+function model.new(identifier, origin)
+    local rig = isfunction(origin) and origin or model.rig(origin)
+    local obj = setmetatable(
+        { origin = rig, bones = {}, bonesIDs = {}, sequences = {}, sequencesIDs = {}, identifier = identifier, poseParameters = {} },
+        ModelInfo
+    )
+    model.registered[identifier] = obj
+    return obj
+end
 
 ---[SHARED] Add new bone to model
 ---@param parent string Identifier of bone to parent
@@ -971,17 +1030,19 @@ function ModelInfo:addSequence(name, duration, startFun)
     return self
 end
 
----@class Sequence
----@field id number ID of sequence to start
----@field start number Relative to curtime
----@field duration number Duration of sequence
----@field process fun(process: number): boolean Relative to curtime
-
----@class ModelEntity: Entity
----@field identifier string Identifier of model
----@field modelInfo ModelInfo Model info
----@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
----@field sequences table<number, Sequence> Layers of sequences
+---[SHARED] Add pose parameter to model
+---@param name string Identifier of sequence
+---@param min number? Minimal value
+---@param max number? Maximal value
+---@return ModelInfo
+function ModelInfo:addPoseParameter(name, min, max)
+    self.poseParameters[name] = {
+        name = name,
+        min = min or -32768,
+        max = max or 32768
+    }
+    return self
+end
 
 ---@class Layer
 ---@field offset Vector
@@ -1013,6 +1074,7 @@ function ModelInfo:create(origin)
         originHolo.modelBones = {}
         originHolo.modelInfo = self
         originHolo.sequences = {}
+        originHolo.poseParameters = {}
         model.inited[id] = originHolo
         return originHolo
     end
@@ -1042,24 +1104,11 @@ function ModelInfo:create(origin)
     originHolo.modelBones = bones
     originHolo.modelInfo = self
     originHolo.sequences = {}
+    originHolo.poseParameters = {}
     model.inited[id] = originHolo
     return originHolo
 end
 
-
----[SHARED] Create new model info
----@param identifier string Identifier of model
----@param origin Vector|modelfun Origin of this entity
----@return ModelInfo
-function model.new(identifier, origin)
-    local rig = isfunction(origin) and origin or model.rig(origin)
-    local obj = setmetatable(
-        { origin = rig, bones = {}, bonesIDs = {}, sequences = {}, sequencesIDs = {}, identifier = identifier },
-        ModelInfo
-    )
-    model.registered[identifier] = obj
-    return obj
-end
 
 ---[SHARED] Create model by registered model info
 ---@param identifier string Identifier of the model
