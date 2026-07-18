@@ -279,9 +279,11 @@ local function modelMethodsOverride(ent)
 
     ent.__getSequenceOld = ent.__getSequenceOld or ent.getSequence
     ---[SHARED] Returns current entity sequence
+    ---@param layer number? Layer of animation
     ---@return number id
-    function ent:getSequence()
-        return ent.sequences[0].id or 0
+    function ent:getSequence(layer)
+        local seq = ent.sequences[layer or 0]
+        return seq and seq.id or 0
     end
 
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
@@ -293,7 +295,10 @@ local function modelMethodsOverride(ent)
         sendFunction("setSequence", id, layerId)
         if CLIENT then
             local seq = ent.modelInfo.sequences[id]
-            if !seq then return end
+            if !seq then
+                ent.sequences[layerId] = nil
+                return
+            end
             local sequence = {}
             ent.sequences[layerId] = sequence
             local process = seq.startFun(ent, layerId)
@@ -828,16 +833,24 @@ model.partsHolos = {}
 local partCreateHolosCoroutine = coroutine.wrap(function(...)
     while true do
         coroutine.yield()
+        local newPartsHolos = {}
         for _, v in ipairs(model.partsHolos) do
-            coroutine.yield()
-            local holo = v[1]()
-            local offset = holo:getLocalPos()
-            local ang = holo:getLocalAngles()
-            holo:setParent(v[2])
-            holo:setLocalPos(offset)
-            holo:setLocalAngles(ang)
+            do
+                coroutine.yield()
+                local holo = v[1]()
+                if !holo then goto cont end
+                local offset = holo:getLocalPos()
+                local ang = holo:getLocalAngles()
+                holo:setParent(v[2])
+                holo:setLocalPos(offset)
+                holo:setLocalAngles(ang)
+                goto cont1
+            end
+            ::cont::
+            newPartsHolos[#newPartsHolos+1] = v
+            ::cont1::
         end
-        model.partsHolos = {}
+        model.partsHolos = newPartsHolos
     end
 end)
 hook.add("Think", "PartCreateHolos", partCreateHolosCoroutine)
