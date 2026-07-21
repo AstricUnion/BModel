@@ -288,13 +288,13 @@ local function modelMethodsOverride(ent)
 
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
     ---[SHARED] Set sequence for this entity
-    ---@param id number Sequence ID
+    ---@param id number|string Sequence ID or name of sequence
     ---@param layerId number? Sequence layer ID. 0 is default
     function ent:setSequence(id, layerId)
         layerId = layerId or 0
         sendFunction("setSequence", id, layerId)
         if CLIENT then
-            local seq = ent.modelInfo.sequences[id]
+            local seq = ent.modelInfo.sequences[isnumber(id) and id or ent.modelInfo.sequencesIDs[id]]
             if !seq then
                 ent.sequences[layerId] = nil
                 return
