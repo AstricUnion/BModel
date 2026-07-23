@@ -289,10 +289,12 @@ local function modelMethodsOverride(ent)
     ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
     ---[SHARED] Set sequence for this entity
     ---@param id number|string Sequence ID or name of sequence
-    ---@param layerId number? Sequence layer ID. 0 is default
-    function ent:setSequence(id, layerId)
+    ---@param layerId number? Sequence layer ID, by default is 1
+    ---@param time number? Time of animation, by default is 0
+    function ent:setSequence(id, layerId, time)
         layerId = layerId or 0
-        sendFunction("setSequence", id, layerId)
+        time = time or 0
+        sendFunction("setSequence", id, layerId, time)
         if CLIENT then
             local seq = ent.modelInfo.sequences[isnumber(id) and id or ent.modelInfo.sequencesIDs[id]]
             if !seq then
@@ -303,7 +305,7 @@ local function modelMethodsOverride(ent)
             ent.sequences[layerId] = sequence
             local process = seq.startFun(ent, layerId)
             sequence.id = id
-            sequence.start = timer.curtime()
+            sequence.start = timer.curtime() - time
             sequence.process = process
             sequence.duration = seq.duration
         end
@@ -596,7 +598,7 @@ else
         return mat
     end
 
-    hook.add("RenderOffscreen", "ModelSequences", function()
+    hook.add("Think", "ModelSequences", function()
         local cur = timer.curtime()
         for _, v in pairs(model.inited) do
             if !isValid(v) then goto cont end
