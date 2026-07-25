@@ -35,6 +35,10 @@ if CLIENT then
         return self.children
     end
 
+    local getParent = function(self)
+        return self.parent
+    end
+
     hologram.__createOld = hologram.__createOld or hologram.create
     function hologram.create(...)
         local holo = hologram.__createOld(...)
@@ -44,6 +48,8 @@ if CLIENT then
         holo.setParent = setParent
         holo.__getChildrenOld = holo.__getChildrenOld or holo.getChildren
         holo.getChildren = getChildren
+        holo.__getParentOld = holo.__getParentOld or holo.getParent
+        holo.getParent = getParent
         return holo
     end
 end
