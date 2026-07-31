@@ -81,95 +81,110 @@ model.rigVisible = false
 
 ---@alias modelfun fun(): (Entity?)
 
+-- maybe move overrides from functions to optimize RAM?
 local function boneMethodsOverride(ent)
     ---@class BoneEntity
     local ent = ent
 
-    if CLIENT then
-        ent.layers = {}
-        ent.offset = ent:getLocalPos()
+    if !CLIENT then return end
+    ent.layers = {}
+    ent.offset = ent:getLocalPos()
 
-        ---[CLIENT] Set local to parent position for layer for animations
-        ---@param layer number Layer to set
-        ---@param pos Vector Position to set
-        function ent:setLocalPosLayer(layer, pos)
-            local layerData = ent.layers[layer]
-            local currentOffset = ent:getLocalPos()
-            if !layerData then
-                ent.layers[layer] = {
-                    offset = pos,
-                    angle = Angle()
-                }
-                ent:setLocalPos(currentOffset + pos)
-                return
-            end
-            layerData.offset = pos
-            local offset = Vector()
-            for _, v in pairs(ent.layers) do
-                offset = offset + v.offset
-            end
-            ent:setLocalPos(ent.offset + offset)
-        end
-
-        ---[CLIENT] Set local to parent angles for layer for animations
-        ---@param layer number Layer to set
-        ---@param angs Angle Angles to set
-        function ent:setLocalAnglesLayer(layer, angs)
-            local layerData = ent.layers[layer]
-            local currentAngles = ent:getLocalAngles()
-            if !layerData then
-                ent.layers[layer] = {
-                    offset = Vector(),
-                    angle = angs
-                }
-                return
-                ent:setLocalAngles(currentAngles + angs)
-            end
-            layerData.angle = angs
-            local angle = Angle()
-            for _, v in pairs(ent.layers) do
-                angle = angle + v.angle
-            end
-            ent:setLocalAngles(angle)
-        end
-
-        ---[CLIENT] Get local to parent position for layer
-        ---@param layer number Layer to get
-        ---@return Vector pos Layer position
-        function ent:getLocalPosLayer(layer)
-            local layerData = ent.layers[layer]
-            return layerData and layerData.offset or Vector()
-        end
-
-        ---[CLIENT] Get local to parent angles for layer
-        ---@param layer number Layer to get
-        ---@return Angle angles Layer angles
-        function ent:getLocalAnglesLayer(layer)
-            local layerData = ent.layers[layer]
-            return layerData and layerData.angle or Angle()
-        end
-
-        ---[CLIENT] Get properties for layer (for tween lib)
-        ---@param layer number Layer to get
-        ---@return ParamProperty pos Layer position property
-        ---@return ParamProperty angles Layer angles property
-        function ent:getPropertyForLayer(layer)
-            return {
-                set = function(propEnt, toSet)
-                    propEnt:setLocalPosLayer(layer, toSet)
-                end,
-                get = function(propEnt)
-                    return propEnt:getLocalPosLayer(layer)
-                end
-            }, {
-                set = function(propEnt, toSet)
-                    propEnt:setLocalAnglesLayer(layer, toSet)
-                end,
-                get = function(propEnt)
-                    return propEnt:getLocalAnglesLayer(layer)
-                end
+    ---[CLIENT] Set local to parent position for layer for animations
+    ---@param layer number Layer to set
+    ---@param pos Vector Position to set
+    function ent:setLocalPosLayer(layer, pos)
+        local layerData = ent.layers[layer]
+        local currentOffset = ent:getLocalPos()
+        if !layerData then
+            ent.layers[layer] = {
+                offset = pos,
+                angle = Angle()
             }
+            ent:setLocalPos(currentOffset + pos)
+            return
         end
+        layerData.offset = pos
+        local offset = Vector()
+        for _, v in pairs(ent.layers) do
+            offset = offset + v.offset
+        end
+        ent:setLocalPos(ent.offset + offset)
+    end
+
+    ---[CLIENT] Set local to parent angles for layer for animations
+    ---@param layer number Layer to set
+    ---@param angs Angle Angles to set
+    function ent:setLocalAnglesLayer(layer, angs)
+        local layerData = ent.layers[layer]
+        local currentAngles = ent:getLocalAngles()
+        if !layerData then
+            ent.layers[layer] = {
+                offset = Vector(),
+                angle = angs
+            }
+            return
+            ent:setLocalAngles(currentAngles + angs)
+        end
+        layerData.angle = angs
+        local angle = Angle()
+        for _, v in pairs(ent.layers) do
+            angle = angle + v.angle
+        end
+        ent:setLocalAngles(angle)
+    end
+
+    ---[CLIENT] Get local to parent position for layer
+    ---@param layer number Layer to get
+    ---@return Vector pos Layer position
+    function ent:getLocalPosLayer(layer)
+        local layerData = ent.layers[layer]
+        return layerData and layerData.offset or Vector()
+    end
+
+    ---[CLIENT] Get local to parent angles for layer
+    ---@param layer number Layer to get
+    ---@return Angle angles Layer angles
+    function ent:getLocalAnglesLayer(layer)
+        local layerData = ent.layers[layer]
+        return layerData and layerData.angle or Angle()
+    end
+
+    ---[CLIENT] Get properties for layer (for tween lib)
+    ---@param layer number Layer to get
+    ---@return ParamProperty pos Layer position property
+    ---@return ParamProperty angles Layer angles property
+    function ent:getPropertyForLayer(layer)
+        return {
+            set = function(propEnt, toSet)
+                propEnt:setLocalPosLayer(layer, toSet)
+            end,
+            get = function(propEnt)
+                return propEnt:getLocalPosLayer(layer)
+            end
+        }, {
+            set = function(propEnt, toSet)
+                propEnt:setLocalAnglesLayer(layer, toSet)
+            end,
+            get = function(propEnt)
+                return propEnt:getLocalAnglesLayer(layer)
+            end
+        }
+    end
+
+    ---[CLIENT] Set no draw for entire bone
+    ---@param state boolean State of no draw
+    function ent:setNoDraw(state)
+        for _, v in pairs(ent:getChildren()) do
+            v:setNoDraw(state)
+        end
+        ent.noDraw = state
+    end
+
+    ---[CLIENT] Get no draw for bone
+    ---@return boolean state State of no draw
+    function ent:getNoDraw()
+        return ent.noDraw
     end
 end
 
@@ -844,11 +859,14 @@ local partCreateHolosCoroutine = coroutine.wrap(function(...)
         local newPartsHolos = {}
         for _, v in ipairs(model.partsHolos) do
             do
-                coroutine.yield()
+                if quotaAverage() > quotaMax() / 4 then
+                    coroutine.yield()
+                end
                 local holo = v[1]()
                 if !holo then goto cont end
                 local offset = holo:getLocalPos()
                 local ang = holo:getLocalAngles()
+                holo:setNoDraw(v[2]:getNoDraw())
                 holo:setParent(v[2])
                 holo:setLocalPos(offset)
                 holo:setLocalAngles(ang)
@@ -927,7 +945,7 @@ function model.holo(tbl)
         local function setMaterial(holo, index, funcMatName)
             local mat = model.materials[funcMatName]
             local matToSet = mat and "!" .. mat:getName() or funcMatName
-            -- Submaterial fixes bug with client material reset
+            -- Submaterial fixes bug with client material reset (because Material URL)
             holo:setSubMaterial(index, matToSet)
         end
         if isstring(matName) then
@@ -971,6 +989,7 @@ end
 ---@field parent string
 ---@field bone modelfun
 ---@field name string
+---@field noDraw boolean
 
 ---@class ModelSequence
 ---@field name string
