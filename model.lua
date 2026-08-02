@@ -172,6 +172,7 @@ local function boneMethodsOverride(ent)
         }
     end
 
+    ent.__setNoDrawOld = ent.__setNoDrawOld or ent.setNoDraw
     ---[CLIENT] Set no draw for entire bone
     ---@param state boolean State of no draw
     function ent:setNoDraw(state)
@@ -179,8 +180,12 @@ local function boneMethodsOverride(ent)
             v:setNoDraw(state)
         end
         ent.noDraw = state
+        if !self.modelRig then
+            ent:__setNoDrawOld(state)
+        end
     end
 
+    ent.__getNoDrawOld = ent.__getNoDrawOld or ent.getNoDraw
     ---[CLIENT] Get no draw for bone
     ---@return boolean state State of no draw
     function ent:getNoDraw()
@@ -698,6 +703,7 @@ function model.rig(pos, ang)
         if !holo then return end
         holo:suppressEngineLighting(true)
         holo:setNoDraw(!model.rigVisible)
+        holo.modelRig = true
         return holo
     end
 end
