@@ -239,6 +239,9 @@ local function modelMethodsOverride(ent)
             else
                 if v[fun] then v[fun](v, ...) end
             end
+            if fun == "setNoDraw" then
+                print(v)
+            end
             recursiveFun(v, fun, ...)
         end
     end
@@ -246,7 +249,7 @@ local function modelMethodsOverride(ent)
     local entId = ent:entIndex()
     local networking = false
     local function sendFunction(func, ...)
-        if !SERVER or !ent.modelBones then return end
+        if !SERVER or !ent.modelInfo then return end
         local args = {...}
         local toNetwork = model.toNetwork[entId]
         if !toNetwork then return end
@@ -1117,7 +1120,6 @@ function ModelInfo:create(origin)
         model.sync()
         originHolo = modelMethodsOverride(originHolo)
         originHolo.identifier = self.identifier
-        originHolo.modelBones = {}
         originHolo.modelInfo = self
         originHolo.sequences = {}
         originHolo.poseParameters = {}
