@@ -272,7 +272,11 @@ local function modelMethodsOverride(ent)
     function ent:setNoDraw(state)
         ent.noDraw = state
         sendFunction("setNoDraw", state)
-        recursiveFun(ent, "setNoDraw", state)
+        recursiveFun(ent, function(holo)
+            if !holo.modelRig then
+                holo:setNoDraw(state)
+            end
+        end)
     end
 
     ent.__getNoDrawOld = ent.__getNoDrawOld or ent.getNoDraw
