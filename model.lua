@@ -239,9 +239,6 @@ local function modelMethodsOverride(ent)
             else
                 if v[fun] then v[fun](v, ...) end
             end
-            if fun == "setNoDraw" then
-                print(v)
-            end
             recursiveFun(v, fun, ...)
         end
     end
