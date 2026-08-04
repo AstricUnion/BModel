@@ -177,10 +177,11 @@ local function boneMethodsOverride(ent)
     ---@param state boolean State of no draw
     function ent:setNoDraw(state)
         for _, v in pairs(ent:getChildren()) do
+            if v == ent then print(v) end
             v:setNoDraw(state)
         end
         ent.noDraw = state
-        if !self.modelRig then
+        if !ent.modelRig then
             ent:__setNoDrawOld(state)
         end
     end
@@ -273,9 +274,11 @@ local function modelMethodsOverride(ent)
         ent.noDraw = state
         sendFunction("setNoDraw", state)
         recursiveFun(ent, function(holo)
-            if !holo.modelRig then
-                holo:setNoDraw(state)
+            if holo:getModel() == "models/editor/axis_helper_thick.mdl" then
+                holo:setNoDraw(holo:getNoDraw())
+                return
             end
+            holo:setNoDraw(state)
         end)
     end
 
