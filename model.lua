@@ -1,6 +1,36 @@
 ---@name Model
 ---@author AstricUnion
 
+---@class ToNetwork
+---@field modelId string Identifier of model
+---@field params table[] Global parameters to set (functions to call)
+---@field paramsToSend table[] Parameters to set to send at this moment
+
+---Class to manipulate hologram models with custom meshes and hitboxes
+---@class model
+---@field registered table<string, ModelInfo>
+---@field inited table<number, ModelEntity>
+---@field mesh table<string, CMesh> Hashmap with mesh to get
+---@field meshToLoad CMesh[] List with mesh to load
+---@field toNetwork table<number, ToNetwork>
+---@field networked table<number, ToNetwork>
+---@field networking boolean
+---@field materials table<string, Material>
+local model = {}
+model.registered = {}
+model.inited = {}
+model.mesh = {}
+model.meshToLoad = {}
+model.materials = {}
+model.toNetwork = {}
+model.networked = {}
+model.networking = false
+model.rigVisible = false
+model.rigModel = "models/editor/axis_helper_thick.mdl"
+
+---@alias modelfun fun(): (Entity?)
+
+
 ---@class Sequence
 ---@field id number ID of sequence to start
 ---@field start number Relative to curtime
@@ -13,6 +43,252 @@
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
 ---@field sequences table<number, Sequence> [CLIENT] Layers of sequences
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
+local ModelEntity = {}
+ModelEntity.networking = false
+
+function ModelEntity:recursiveFun(fun, ...)
+    for _, v in pairs(self.modelBones or self:getChildren()) do
+        if isfunction(fun) then
+            fun(v, ...)
+        else
+            if v[fun] then v[fun](v, ...) end
+        end
+        self:recursiveFun(v, fun, ...)
+    end
+end
+
+function ModelEntity:sendFunction(func, ...)
+    if !SERVER or !self.modelInfo then return end
+    local entId = self:entIndex()
+    local args = {...}
+    local toNetwork = model.toNetwork[entId]
+    if !toNetwork then return end
+    local params = toNetwork.paramsToSend
+    local globalParams = toNetwork.params
+    local tab = {func, args}
+    params[#params+1] = tab
+    globalParams[#globalParams+1] = tab
+    if self.networking then return end
+    self.networking = true
+    timer.simple(0, function()
+        if !isValid(self) then return end
+        net.start("ModelCallFunctions")
+            net.writeTable(params)
+            net.writeEntity(self)
+        net.send(find.allPlayers())
+        table.empty(params)
+        self.networking = false
+    end)
+end
+
+function ModelEntity:setNoDraw(state)
+    self.noDraw = state
+    self:sendFunction("setNoDraw", state)
+    self:recursiveFun(function(holo)
+        if holo:getModel() == model.rigModel then
+            holo:setNoDraw(holo:getNoDraw())
+            return
+        end
+        holo:setNoDraw(state)
+    end)
+end
+
+function ModelEntity:getNoDraw()
+    return self.noDraw
+end
+
+function ModelEntity:setCullMode(state)
+    for _, v in pairs(self:getChildren()) do
+        v:setCullMode(state)
+    end
+end
+
+---[SHARED] Lookup for bone in entity
+---@param name string Name of the bone
+---@return number id
+function ModelEntity:lookupBone(name)
+    return self.modelInfo.bonesIDs[name] or -1
+end
+
+---[SHARED] Lookup for sequence in entity
+---@param name string Name of the sequence
+---@return number id
+function ModelEntity:lookupSequence(name)
+    return self.modelInfo.sequencesIDs[name] or -1
+end
+
+---[SHARED] Returns currself entity sequence
+---@param layer number? Layer of animation
+---@return number id
+function ModelEntity:getSequence(layer)
+    local seq = self.sequences[layer or 0]
+    return seq and seq.id or 0
+end
+
+---[SHARED] Set sequence for this entity
+---@param id number|string Sequence ID or name of sequence
+---@param layerId number? Sequence layer ID, by default is 1
+---@param time number? Time of animation, by default is 0
+function ModelEntity:setSequence(id, layerId, time)
+    layerId = layerId or 0
+    time = time or 0
+    self:sendFunction("setSequence", id, layerId, time)
+    if CLIENT then
+        local seq = self.modelInfo.sequences[isnumber(id) and id or self.modelInfo.sequencesIDs[id]]
+        if !seq then
+            self.sequences[layerId] = nil
+            return
+        end
+        local sequence = {}
+        self.sequences[layerId] = sequence
+        local process = seq.startFun(self, layerId)
+        sequence.id = id
+        sequence.start = timer.curtime() - time
+        sequence.process = process
+        sequence.duration = seq.duration
+    end
+end
+
+---[SHARED] Returns currself entity pose parameter
+---@param name string Name of pose parameter
+---@return number value
+function ModelEntity:getPoseParameter(name)
+    return self.poseParameters[name] or 0
+end
+
+---[SHARED] Set pose parameter for this entity
+---@param name string Name of pose parameter
+---@param value number Value to set
+function ModelEntity:setPoseParameter(name, value)
+    self:sendFunction("setPoseParameter", name, value)
+    if CLIENT then
+        local param = self.modelInfo.poseParameters[name]
+        if !param then return end
+        self.poseParameters[name] = math.clamp(value, param.min, param.max)
+    end
+end
+
+---[SHARED] Set submaterial for this model
+---@param index number Submaterial index. 0 is default for all
+---@param mat string Material to set
+function ModelEntity:setSubMaterial(index, mat)
+    self:sendFunction("setSubMaterial", index, mat)
+    self:recursiveFun(index ~= -1 and function(holo)
+        if holo.modelSubmaterial == index then
+            holo:setSubMaterial(0, mat)
+        end
+    end)
+end
+
+---[SHARED] Set main material for this model
+---@param mat string Material to set
+function ModelEntity:setMaterial(mat)
+    self:sendFunction("setMaterial", mat)
+    self:recursiveFun("setSubMaterial", 0, mat)
+end
+
+---[SHARED] Set subcolor for this model
+---@param index number Color index. 0 is default for all
+---@param col Color Color to set
+function ModelEntity:setSubColor(index, col)
+    self:sendFunction("setSubColor", index, col)
+    self:recursiveFun(function(holo)
+        if holo.modelSubcolor == index then
+            holo:setColor(col)
+        end
+    end)
+end
+
+---[SHARED] Set color for this model
+---@param col Color Color to set
+function ModelEntity:setColor(col)
+    self:sendFunction("setColor", col)
+    self:recursiveFun("setColor", col)
+end
+
+---[SHARED] Set render FX for this model
+---@param renderFx number Render FX. RENDERFX enum
+function ModelEntity:setRenderFX(renderFx)
+    self:sendFunction("setRenderFX", renderFx)
+    self:recursiveFun("setRenderFX", renderFx)
+end
+
+if CLIENT then
+    function ModelEntity:draw(noTint)
+        self:recursiveFun("draw", noTint)
+    end
+
+    ---[CLIENT] Get entity of the bone
+    ---@param id number Index of the bone
+    ---@return BoneEntity?
+    function ModelEntity:getBoneEntity(id)
+        return self.modelBones[id]
+    end
+
+    local function vectorToPrefixed(prefix, vec)
+        return string.format("\n%s %s %s %s", prefix, vec.x, vec.y, vec.z)
+    end
+
+    local function objFromModel(mdl, offset, angle, scale, numOffset)
+        scale = scale
+        local msh = mesh.getModelMeshes(mdl)
+        if !msh then return end
+        local vertexes = ""
+        local normals = ""
+        local faces = ""
+        local verticies = msh[1].triangles
+        local function getIndex(id)
+            local v = verticies[id]
+            if !v then return end
+            vertexes = vertexes .. vectorToPrefixed("v", localToWorld(v.pos * scale, Angle(), offset, angle) / 39.37008)
+            normals = normals .. vectorToPrefixed("vn", v.normal)
+            return id
+        end
+        local numVert = #verticies
+        for i=1, numVert, 3 do
+            local v1i = getIndex(i)
+            local v2i = getIndex(i+1)
+            local v3i = getIndex(i+2)
+            if !(v1i and v2i and v3i) then goto cont end
+            faces = faces .. vectorToPrefixed("f", Vector(v1i + numOffset, v2i + numOffset, v3i + numOffset))
+            ::cont::
+        end
+        return vertexes, normals, faces, numVert
+    end
+
+    ---[CLIENT] Get OBJ with rig for Blender
+    ---@return string mdlData
+    function ModelEntity:getObj()
+        local objData = ""
+        local boneString = ""
+        local offset = 0
+        local originPos, originAng = self:getPos(), self:getAngles()
+        local boneInfos = self.modelInfo.bones
+        for i, v in ipairs(self.modelBones) do
+            local vertexesGl = ""
+            local normalsGl = ""
+            local facesGl = ""
+            for _, child in pairs(v:getChildren()) do
+                if child == v then goto cont end
+                local pos, ang = worldToLocal(child:getPos(), child:getAngles(), originPos, originAng)
+                local vertexes, normals, faces, num = objFromModel(child:getModel(), pos, ang, child:getScale(), offset)
+                offset = offset + num
+                vertexesGl = vertexesGl .. vertexes
+                normalsGl = normalsGl .. normals
+                facesGl = facesGl .. faces
+                ::cont::
+            end
+            local boneInfo = boneInfos[i]
+            local name = boneInfo.name
+            objData = objData .. "o " .. name .. vertexesGl .. normalsGl .. facesGl .. "\n"
+            local parentName = boneInfo.parent
+            local pos = v:getPos() / 39.37008
+            local ang = v:getAngles()
+            boneString = boneString .. string.format("#%s;%s,%s,%s;%s,%s,%s;%s\n", name, pos.x, pos.y, pos.z, ang.p, ang.y, ang.r, parentName)
+        end
+        return boneString .. "\n" .. objData
+    end
+end
 
 -- implement client parents for holograms
 if CLIENT then
@@ -54,32 +330,6 @@ if CLIENT then
     end
 end
 
-
----@class ToNetwork
----@field modelId string Identifier of model
----@field params table[] Global parameters to set (functions to call)
----@field paramsToSend table[] Parameters to set to send at this moment
-
----Class to manipulate hologram models with custom meshes and hitboxes
----@class model
----@field registered table<string, ModelInfo>
----@field inited table<number, ModelEntity>
----@field mesh table<string, CMesh> Hashmap with mesh to get
----@field meshToLoad CMesh[] List with mesh to load
----@field toNetwork table<number, ToNetwork>
----@field networked table<number, ToNetwork>
----@field materials table<string, Material>
-local model = {}
-model.registered = {}
-model.inited = {}
-model.mesh = {}
-model.meshToLoad = {}
-model.materials = {}
-model.toNetwork = {}
-model.networked = {}
-model.rigVisible = false
-
----@alias modelfun fun(): (Entity?)
 
 -- maybe move overrides from functions to optimize RAM?
 local function boneMethodsOverride(ent)
@@ -194,282 +444,23 @@ local function boneMethodsOverride(ent)
     end
 end
 
-local function vectorToPrefixed(prefix, vec)
-    return string.format("\n%s %s %s %s", prefix, vec.x, vec.y, vec.z)
-end
-
-local function objFromModel(mdl, offset, angle, scale, numOffset)
-    scale = scale
-    local msh = mesh.getModelMeshes(mdl)
-    if !msh then return end
-    local vertexes = ""
-    local normals = ""
-    local faces = ""
-    local verticies = msh[1].triangles
-    local function getIndex(id)
-        local v = verticies[id]
-        if !v then return end
-        vertexes = vertexes .. vectorToPrefixed("v", localToWorld(v.pos * scale, Angle(), offset, angle) / 39.37008)
-        normals = normals .. vectorToPrefixed("vn", v.normal)
-        return id
-    end
-    local numVert = #verticies
-    for i=1, numVert, 3 do
-        local v1i = getIndex(i)
-        local v2i = getIndex(i+1)
-        local v3i = getIndex(i+2)
-        if !(v1i and v2i and v3i) then goto cont end
-        faces = faces .. vectorToPrefixed("f", Vector(v1i + numOffset, v2i + numOffset, v3i + numOffset))
-        ::cont::
-    end
-    return vertexes, normals, faces, numVert
-end
-
 
 ---Override methods of entity to work with models
 ---@param ent Entity
 ---@return ModelEntity
 local function modelMethodsOverride(ent)
-    ---@class ModelEntity
-    local ent = ent
-
-    local function recursiveFun(origin, fun, ...)
-        for _, v in pairs(origin.modelBones or origin:getChildren()) do
-            if isfunction(fun) then
-                fun(v, ...)
-            else
-                if v[fun] then v[fun](v, ...) end
-            end
-            recursiveFun(v, fun, ...)
-        end
+    for name, v in pairs(ModelEntity) do
+        ent["__" .. name .. "Old"] = ent[name]
+        ent[name] = v
     end
-
-    local entId = ent:entIndex()
-    local networking = false
-    local function sendFunction(func, ...)
-        if !SERVER or !ent.modelInfo then return end
-        local args = {...}
-        local toNetwork = model.toNetwork[entId]
-        if !toNetwork then return end
-        local params = toNetwork.paramsToSend
-        local globalParams = toNetwork.params
-        local tab = {func, args}
-        params[#params+1] = tab
-        globalParams[#globalParams+1] = tab
-        if networking then return end
-        networking = true
-        timer.simple(0, function()
-            if !isValid(ent) then return end
-            net.start("ModelCallFunctions")
-                net.writeTable(params)
-                net.writeEntity(ent)
-            net.send(find.allPlayers())
-            table.empty(params)
-            networking = false
-        end)
-    end
-    -- I can use ent, not self, because this is method only for this entity
-    ent.__setNoDrawOld = ent.__setNoDrawOld or ent.setNoDraw
-    function ent:setNoDraw(state)
-        ent.noDraw = state
-        sendFunction("setNoDraw", state)
-        recursiveFun(ent, function(holo)
-            if holo:getModel() == "models/editor/axis_helper_thick.mdl" then
-                holo:setNoDraw(holo:getNoDraw())
-                return
-            end
-            holo:setNoDraw(state)
-        end)
-    end
-
-    ent.__getNoDrawOld = ent.__getNoDrawOld or ent.getNoDraw
-    function ent:getNoDraw()
-        return ent.noDraw
-    end
-
-    ent.__setCullModeOld = ent.__setCullModeOld or ent.setCullMode
-    function ent:setCullMode(state)
-        for _, v in pairs(ent:getChildren()) do
-            v:setCullMode(state)
-        end
-    end
-
-    ent.__lookupBoneOld = ent.__lookupBoneOld or ent.lookupBone
-    ---[SHARED] Lookup for bone in entity
-    ---@param name string Name of the bone
-    ---@return number id
-    function ent:lookupBone(name)
-        return ent.modelInfo.bonesIDs[name] or -1
-    end
-
-    ent.__lookupSequenceOld = ent.__lookupSequenceOld or ent.lookupSequence
-    ---[SHARED] Lookup for sequence in entity
-    ---@param name string Name of the sequence
-    ---@return number id
-    function ent:lookupSequence(name)
-        return ent.modelInfo.sequencesIDs[name] or -1
-    end
-
-    ent.__getSequenceOld = ent.__getSequenceOld or ent.getSequence
-    ---[SHARED] Returns current entity sequence
-    ---@param layer number? Layer of animation
-    ---@return number id
-    function ent:getSequence(layer)
-        local seq = ent.sequences[layer or 0]
-        return seq and seq.id or 0
-    end
-
-    ent.__setSequenceOld = ent.__setSequenceOld or ent.setSequence
-    ---[SHARED] Set sequence for this entity
-    ---@param id number|string Sequence ID or name of sequence
-    ---@param layerId number? Sequence layer ID, by default is 1
-    ---@param time number? Time of animation, by default is 0
-    function ent:setSequence(id, layerId, time)
-        layerId = layerId or 0
-        time = time or 0
-        sendFunction("setSequence", id, layerId, time)
-        if CLIENT then
-            local seq = ent.modelInfo.sequences[isnumber(id) and id or ent.modelInfo.sequencesIDs[id]]
-            if !seq then
-                ent.sequences[layerId] = nil
-                return
-            end
-            local sequence = {}
-            ent.sequences[layerId] = sequence
-            local process = seq.startFun(ent, layerId)
-            sequence.id = id
-            sequence.start = timer.curtime() - time
-            sequence.process = process
-            sequence.duration = seq.duration
-        end
-    end
-
-    ent.__getPoseParameterOld = ent.__getPoseParameterOld or ent.getPoseParameter
-    ---[SHARED] Returns current entity pose parameter
-    ---@param name string Name of pose parameter
-    ---@return number value
-    function ent:getPoseParameter(name)
-        return ent.poseParameters[name] or 0
-    end
-
-    ent.__setPoseParameterOld = ent.__setPoseParameterOld or ent.setPoseParameter
-    ---[SHARED] Set pose parameter for this entity
-    ---@param name string Name of pose parameter
-    ---@param value number Value to set
-    function ent:setPoseParameter(name, value)
-        sendFunction("setPoseParameter", name, value)
-        if CLIENT then
-            local param = ent.modelInfo.poseParameters[name]
-            if !param then return end
-            ent.poseParameters[name] = math.clamp(value, param.min, param.max)
-        end
-    end
-
-    ent.__setSubMaterialOld = ent.__setSubMaterialOld or ent.setSubMaterial
-    ---[SHARED] Set submaterial for this model
-    ---@param index number Submaterial index. 0 is default for all
-    ---@param mat string Material to set
-    function ent:setSubMaterial(index, mat)
-        sendFunction("setSubMaterial", index, mat)
-        recursiveFun(ent, index ~= -1 and function(holo)
-            if holo.modelSubmaterial == index then
-                holo:setSubMaterial(0, mat)
-            end
-        end)
-    end
-
-    ent.__setMaterialOld = ent.__setMaterialOld or ent.setMaterial
-    ---[SHARED] Set main material for this model
-    ---@param mat string Material to set
-    function ent:setMaterial(mat)
-        sendFunction("setMaterial", mat)
-        recursiveFun(ent, "setSubMaterial", 0, mat)
-    end
-
-    ---[SHARED] Set subcolor for this model
-    ---@param index number Color index. 0 is default for all
-    ---@param col Color Color to set
-    function ent:setSubColor(index, col)
-        sendFunction("setSubColor", index, col)
-        recursiveFun(ent, function(holo)
-            if holo.modelSubcolor == index then
-                holo:setColor(col)
-            end
-        end)
-    end
-
-    ent.__setColorOld = ent.__setColorOld or ent.setColor
-    ---[SHARED] Set color for this model
-    ---@param col Color Color to set
-    function ent:setColor(col)
-        sendFunction("setColor", col)
-        recursiveFun(ent, "setColor", col)
-    end
-
-    ent.__setRenderFXOld = ent.__setRenderFXOld or ent.setRenderFX
-    ---[SHARED] Set render FX for this model
-    ---@param renderFx number Render FX. RENDERFX enum
-    function ent:setRenderFX(renderFx)
-        sendFunction("setRenderFX", renderFx)
-        recursiveFun(ent, "setRenderFX", renderFx)
-    end
-
-    if CLIENT then
-        ent.__drawOld = ent.__drawOld or ent.draw
-        function ent:draw(noTint)
-            recursiveFun(ent, "draw", noTint)
-        end
-
-        ---[CLIENT] Get entity of the bone
-        ---@param id number Index of the bone
-        ---@return BoneEntity?
-        function ent:getBoneEntity(id)
-            return ent.modelBones[id]
-        end
-
-        ---[CLIENT] Get OBJ with rig for Blender
-        ---@return string mdlData
-        function ent:getObj()
-            local objData = ""
-            local boneString = ""
-            local offset = 0
-            local originPos, originAng = ent:getPos(), ent:getAngles()
-            local boneInfos = self.modelInfo.bones
-            for i, v in ipairs(self.modelBones) do
-                local vertexesGl = ""
-                local normalsGl = ""
-                local facesGl = ""
-                for _, child in pairs(v:getChildren()) do
-                    if child == v then goto cont end
-                    local pos, ang = worldToLocal(child:getPos(), child:getAngles(), originPos, originAng)
-                    local vertexes, normals, faces, num = objFromModel(child:getModel(), pos, ang, child:getScale(), offset)
-                    offset = offset + num
-                    vertexesGl = vertexesGl .. vertexes
-                    normalsGl = normalsGl .. normals
-                    facesGl = facesGl .. faces
-                    ::cont::
-                end
-                local boneInfo = boneInfos[i]
-                local name = boneInfo.name
-                objData = objData .. "o " .. name .. vertexesGl .. normalsGl .. facesGl .. "\n"
-                local parentName = boneInfo.parent
-                local pos = v:getPos() / 39.37008
-                local ang = v:getAngles()
-                boneString = boneString .. string.format("#%s;%s,%s,%s;%s,%s,%s;%s\n", name, pos.x, pos.y, pos.z, ang.p, ang.y, ang.r, parentName)
-            end
-            return boneString .. "\n" .. objData
-        end
-    end
+    ---@cast ent ModelEntity
 
     return ent
 end
 
 if SERVER then
-    local networking = false
-
     ---[SERVER] Sync holograms to clients
-    ---@param ply Player? Player to send. False to prevent send (to clear toNetwork)
-    function model.sync(ply)
+    function model.sync()
         local newToNetwork = {}
         for id, toNetworkInfo in pairs(model.toNetwork) do
             local origin = entity(id)
@@ -478,20 +469,20 @@ if SERVER then
             ::cont::
         end
         model.toNetwork = newToNetwork
-        if networking then return end
-        networking = true
+        if model.networking then return end
+        model.networking = true
         timer.simple(0, function()
             net.start("NetworkModels")
                 net.writeTable(model.toNetwork)
             net.send(find.allPlayers())
-            networking = false
+            model.networking = false
         end)
     end
 
-    hook.add("ClientInitialized", "InitializeModels", function(ply)
-        if table.isEmpty(model.toNetwork) then return end
-        model.sync(ply)
-    end)
+    -- hook.add("ClientInitialized", "InitializeModels", function(ply)
+    --     if table.isEmpty(model.toNetwork) then return end
+    --     model.sync()
+    -- end)
 else
     ---@class MeshPretend
     ---@field holo Hologram
@@ -561,27 +552,27 @@ else
         model.networked = net.readTable()
     end)
 
-    local function getNetworkedModels()
-        for id, toNetworkInfo in pairs(model.networked) do
-            local ent = entity(id)
-            if !isValid(ent) then goto cont end
-            if ent.modelBones then
-                model.networked[id] = nil
-                return
-            end
-            local mdl = model.registered[toNetworkInfo.modelId]
-            if !mdl then goto cont end
-            mdl:create(ent)
-            modelMethodsOverride(ent)
-            for _, funcTable in ipairs(toNetworkInfo.params) do
-                if !ent[funcTable[1]] then goto cont end
-                ent[funcTable[1]](ent, unpack(funcTable[2]))
-                ::cont::
-            end
-            model.networked[id] = nil
-            ::cont::
-        end
-    end
+    -- local function getNetworkedModels()
+    --     for id, toNetworkInfo in pairs(model.networked) do
+    --         local ent = entity(id)
+    --         if !isValid(ent) then goto cont end
+    --         if ent.modelBones then
+    --             model.networked[id] = nil
+    --             return
+    --         end
+    --         local mdl = model.registered[toNetworkInfo.modelId]
+    --         if !mdl then goto cont end
+    --         mdl:create(ent)
+    --         modelMethodsOverride(ent)
+    --         for _, funcTable in ipairs(toNetworkInfo.params) do
+    --             if !ent[funcTable[1]] then goto cont end
+    --             ent[funcTable[1]](ent, unpack(funcTable[2]))
+    --             ::cont::
+    --         end
+    --         model.networked[id] = nil
+    --         ::cont::
+    --     end
+    -- end
 
     hook.add("Think", "CustomMeshLoad", function()
         if next(model.meshToLoad) ~= nil then
@@ -596,6 +587,8 @@ else
             getNetworkedModels()
         end
     end)
+
+    hook.add("NetworkEntityCreated", "NetworkModels", )
 
     ---[CLIENT] Set this mesh to hologram
     ---@param holo Hologram Hologram to set
@@ -706,7 +699,7 @@ function model.rig(pos, ang)
     ang = ang or Angle()
     return function()
         if !hologram.canSpawn() then return end
-        local holo = hologram.create(pos, ang, "models/editor/axis_helper_thick.mdl", rigScale)
+        local holo = hologram.create(pos, ang, model.rigModel, rigScale)
         if !holo then return end
         holo:suppressEngineLighting(true)
         holo:setNoDraw(!model.rigVisible)
@@ -1116,12 +1109,12 @@ function ModelInfo:create(origin)
     end
     local id = originHolo:entIndex()
     if SERVER then
-        model.toNetwork[id] = {
-            modelId = self.identifier,
-            params = {},
-            paramsToSend = {}
-        }
-        model.sync()
+        -- model.toNetwork[id] = {
+        --     modelId = self.identifier,
+        --     params = {},
+        --     paramsToSend = {}
+        -- }
+        -- model.sync()
         originHolo = modelMethodsOverride(originHolo)
         originHolo.identifier = self.identifier
         originHolo.modelInfo = self
