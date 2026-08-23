@@ -1,6 +1,47 @@
 ---@name Model
 ---@author AstricUnion
 
+
+-- implement client parents for holograms
+if CLIENT then
+    local setParent = function(self, par)
+        if self.parent then
+            self.parent.children[self] = nil
+            self.parent = nil
+        end
+        if par then
+            par.children = par.children or {}
+            par.children[self] = self
+            self.parent = par
+            self:__setParentOld(par)
+        else
+            self:__setParentOld(nil)
+        end
+    end
+
+    local getChildren = function(self)
+        return self.children
+    end
+
+    local getParent = function(self)
+        return self.parent
+    end
+
+    hologram.__createOld = hologram.__createOld or hologram.create
+    function hologram.create(...)
+        local holo = hologram.__createOld(...)
+        if !holo then return end
+        holo.children = {}
+        holo.__setParentOld = holo.__setParentOld or holo.setParent
+        holo.setParent = setParent
+        holo.__getChildrenOld = holo.__getChildrenOld or holo.getChildren
+        holo.getChildren = getChildren
+        holo.__getParentOld = holo.__getParentOld or holo.getParent
+        holo.getParent = getParent
+        return holo
+    end
+end
+
 ---@class ToNetwork
 ---@field modelId string Identifier of model
 ---@field params table[] Global parameters to set (functions to call)
@@ -290,158 +331,128 @@ if CLIENT then
     end
 end
 
--- implement client parents for holograms
-if CLIENT then
-    local setParent = function(self, par)
-        if self.parent then
-            self.parent.children[self] = nil
-            self.parent = nil
+---@class BoneEntity: Entity
+---@field identifier string Identifier of bone
+---@field layers table<number, Layer> Animation layers
+---@field offset Vector Initial offset of bone
+local BoneEntity = {}
+
+---[CLIENT] Set local to parent position for layer for animations
+---@param layer number Layer to set
+---@param pos Vector Position to set
+function BoneEntity:setLocalPosLayer(layer, pos)
+    local layerData = self.layers[layer]
+    local currentOffset = self:getLocalPos()
+    if !layerData then
+        self.layers[layer] = {
+            offset = pos,
+            angle = Angle()
+        }
+        self:setLocalPos(currentOffset + pos)
+        return
+    end
+    layerData.offset = pos
+    local offset = Vector()
+    for _, v in pairs(self.layers) do
+        offset = offset + v.offset
+    end
+    self:setLocalPos(self.offset + offset)
+end
+
+---[CLIENT] Set local to parent angles for layer for animations
+---@param layer number Layer to set
+---@param angs Angle Angles to set
+function BoneEntity:setLocalAnglesLayer(layer, angs)
+    local layerData = self.layers[layer]
+    local currentAngles = self:getLocalAngles()
+    if !layerData then
+        self.layers[layer] = {
+            offset = Vector(),
+            angle = angs
+        }
+        return
+        self:setLocalAngles(currentAngles + angs)
+    end
+    layerData.angle = angs
+    local angle = Angle()
+    for _, v in pairs(self.layers) do
+        angle = angle + v.angle
+    end
+    self:setLocalAngles(angle)
+end
+
+---[CLIENT] Get local to parent position for layer
+---@param layer number Layer to get
+---@return Vector pos Layer position
+function BoneEntity:getLocalPosLayer(layer)
+    local layerData = self.layers[layer]
+    return layerData and layerData.offset or Vector()
+end
+
+---[CLIENT] Get local to parent angles for layer
+---@param layer number Layer to get
+---@return Angle angles Layer angles
+function BoneEntity:getLocalAnglesLayer(layer)
+    local layerData = self.layers[layer]
+    return layerData and layerData.angle or Angle()
+end
+
+---[CLIENT] Get properties for layer (for tween lib)
+---@param layer number Layer to get
+---@return ParamProperty pos Layer position property
+---@return ParamProperty angles Layer angles property
+function BoneEntity:getPropertyForLayer(layer)
+    return {
+        set = function(propEnt, toSet)
+            propEnt:setLocalPosLayer(layer, toSet)
+        end,
+        get = function(propEnt)
+            return propEnt:getLocalPosLayer(layer)
         end
-        if par then
-            par.children = par.children or {}
-            par.children[self] = self
-            self.parent = par
-            self:__setParentOld(par)
-        else
-            self:__setParentOld(nil)
+    }, {
+        set = function(propEnt, toSet)
+            propEnt:setLocalAnglesLayer(layer, toSet)
+        end,
+        get = function(propEnt)
+            return propEnt:getLocalAnglesLayer(layer)
         end
-    end
+    }
+end
 
-    local getChildren = function(self)
-        return self.children
+---[CLIENT] Set no draw for entire bone
+---@param state boolean State of no draw
+function BoneEntity:setNoDraw(state)
+    for _, v in pairs(self:getChildren()) do
+        if v == self then print(v) end
+        v:setNoDraw(state)
     end
-
-    local getParent = function(self)
-        return self.parent
-    end
-
-    hologram.__createOld = hologram.__createOld or hologram.create
-    function hologram.create(...)
-        local holo = hologram.__createOld(...)
-        if !holo then return end
-        holo.children = {}
-        holo.__setParentOld = holo.__setParentOld or holo.setParent
-        holo.setParent = setParent
-        holo.__getChildrenOld = holo.__getChildrenOld or holo.getChildren
-        holo.getChildren = getChildren
-        holo.__getParentOld = holo.__getParentOld or holo.getParent
-        holo.getParent = getParent
-        return holo
+    self.noDraw = state
+    if !self.modelRig then
+        self:__setNoDrawOld(state)
     end
 end
 
+---[CLIENT] Get no draw for bone
+---@return boolean state State of no draw
+function BoneEntity:getNoDraw()
+    return self.noDraw
+end
 
--- maybe move overrides from functions to optimize RAM?
+
+---Override methods of entity to work with models (as bone)
+---@param ent Entity
+---@return ModelEntity
 local function boneMethodsOverride(ent)
-    ---@class BoneEntity
-    local ent = ent
-
-    if !CLIENT then return end
-    ent.layers = {}
     ent.offset = ent:getLocalPos()
-
-    ---[CLIENT] Set local to parent position for layer for animations
-    ---@param layer number Layer to set
-    ---@param pos Vector Position to set
-    function ent:setLocalPosLayer(layer, pos)
-        local layerData = ent.layers[layer]
-        local currentOffset = ent:getLocalPos()
-        if !layerData then
-            ent.layers[layer] = {
-                offset = pos,
-                angle = Angle()
-            }
-            ent:setLocalPos(currentOffset + pos)
-            return
-        end
-        layerData.offset = pos
-        local offset = Vector()
-        for _, v in pairs(ent.layers) do
-            offset = offset + v.offset
-        end
-        ent:setLocalPos(ent.offset + offset)
+    ent.layers = {}
+    for name, v in pairs(BoneEntity) do
+        local old = "__" .. name .. "Old"
+        ent[old] = ent[old] or ent[name]
+        ent[name] = v
     end
+    ---@cast ent BoneEntity
 
-    ---[CLIENT] Set local to parent angles for layer for animations
-    ---@param layer number Layer to set
-    ---@param angs Angle Angles to set
-    function ent:setLocalAnglesLayer(layer, angs)
-        local layerData = ent.layers[layer]
-        local currentAngles = ent:getLocalAngles()
-        if !layerData then
-            ent.layers[layer] = {
-                offset = Vector(),
-                angle = angs
-            }
-            return
-            ent:setLocalAngles(currentAngles + angs)
-        end
-        layerData.angle = angs
-        local angle = Angle()
-        for _, v in pairs(ent.layers) do
-            angle = angle + v.angle
-        end
-        ent:setLocalAngles(angle)
-    end
-
-    ---[CLIENT] Get local to parent position for layer
-    ---@param layer number Layer to get
-    ---@return Vector pos Layer position
-    function ent:getLocalPosLayer(layer)
-        local layerData = ent.layers[layer]
-        return layerData and layerData.offset or Vector()
-    end
-
-    ---[CLIENT] Get local to parent angles for layer
-    ---@param layer number Layer to get
-    ---@return Angle angles Layer angles
-    function ent:getLocalAnglesLayer(layer)
-        local layerData = ent.layers[layer]
-        return layerData and layerData.angle or Angle()
-    end
-
-    ---[CLIENT] Get properties for layer (for tween lib)
-    ---@param layer number Layer to get
-    ---@return ParamProperty pos Layer position property
-    ---@return ParamProperty angles Layer angles property
-    function ent:getPropertyForLayer(layer)
-        return {
-            set = function(propEnt, toSet)
-                propEnt:setLocalPosLayer(layer, toSet)
-            end,
-            get = function(propEnt)
-                return propEnt:getLocalPosLayer(layer)
-            end
-        }, {
-            set = function(propEnt, toSet)
-                propEnt:setLocalAnglesLayer(layer, toSet)
-            end,
-            get = function(propEnt)
-                return propEnt:getLocalAnglesLayer(layer)
-            end
-        }
-    end
-
-    ent.__setNoDrawOld = ent.__setNoDrawOld or ent.setNoDraw
-    ---[CLIENT] Set no draw for entire bone
-    ---@param state boolean State of no draw
-    function ent:setNoDraw(state)
-        for _, v in pairs(ent:getChildren()) do
-            if v == ent then print(v) end
-            v:setNoDraw(state)
-        end
-        ent.noDraw = state
-        if !ent.modelRig then
-            ent:__setNoDrawOld(state)
-        end
-    end
-
-    ent.__getNoDrawOld = ent.__getNoDrawOld or ent.getNoDraw
-    ---[CLIENT] Get no draw for bone
-    ---@return boolean state State of no draw
-    function ent:getNoDraw()
-        return ent.noDraw
-    end
+    return ent
 end
 
 
@@ -450,7 +461,8 @@ end
 ---@return ModelEntity
 local function modelMethodsOverride(ent)
     for name, v in pairs(ModelEntity) do
-        ent["__" .. name .. "Old"] = ent[name]
+        local old = "__" .. name .. "Old"
+        ent[old] = ent[old] or ent[name]
         ent[name] = v
     end
     ---@cast ent ModelEntity
@@ -460,7 +472,7 @@ end
 
 if SERVER then
     ---[SERVER] Sync holograms to clients
-    function model.sync()
+    function model.sync(ply)
         local newToNetwork = {}
         for id, toNetworkInfo in pairs(model.toNetwork) do
             local origin = entity(id)
@@ -469,20 +481,15 @@ if SERVER then
             ::cont::
         end
         model.toNetwork = newToNetwork
-        if model.networking then return end
-        model.networking = true
-        timer.simple(0, function()
-            net.start("NetworkModels")
-                net.writeTable(model.toNetwork)
-            net.send(find.allPlayers())
-            model.networking = false
-        end)
+        net.start("NetworkModels")
+            net.writeTable(model.toNetwork)
+        net.send(ply or find.allPlayers())
     end
 
-    -- hook.add("ClientInitialized", "InitializeModels", function(ply)
-    --     if table.isEmpty(model.toNetwork) then return end
-    --     model.sync()
-    -- end)
+    hook.add("ClientInitialized", "InitializeModels", function(ply)
+        if table.isEmpty(model.toNetwork) then return end
+        model.sync(ply)
+    end)
 else
     ---@class MeshPretend
     ---@field holo Hologram
@@ -550,29 +557,21 @@ else
 
     net.receive("NetworkModels", function()
         model.networked = net.readTable()
+        for id, toNetworkInfo in pairs(model.networked) do
+            local ent = entity(id)
+            if !isValid(ent) then goto cont end
+            local mdl = model.registered[toNetworkInfo.modelId]
+            if !mdl then goto cont end
+            mdl:create(ent)
+            modelMethodsOverride(ent)
+            for _, funcTable in ipairs(toNetworkInfo.params) do
+                if !ent[funcTable[1]] then goto cont end
+                ent[funcTable[1]](ent, unpack(funcTable[2]))
+                ::cont::
+            end
+            ::cont::
+        end
     end)
-
-    -- local function getNetworkedModels()
-    --     for id, toNetworkInfo in pairs(model.networked) do
-    --         local ent = entity(id)
-    --         if !isValid(ent) then goto cont end
-    --         if ent.modelBones then
-    --             model.networked[id] = nil
-    --             return
-    --         end
-    --         local mdl = model.registered[toNetworkInfo.modelId]
-    --         if !mdl then goto cont end
-    --         mdl:create(ent)
-    --         modelMethodsOverride(ent)
-    --         for _, funcTable in ipairs(toNetworkInfo.params) do
-    --             if !ent[funcTable[1]] then goto cont end
-    --             ent[funcTable[1]](ent, unpack(funcTable[2]))
-    --             ::cont::
-    --         end
-    --         model.networked[id] = nil
-    --         ::cont::
-    --     end
-    -- end
 
     hook.add("Think", "CustomMeshLoad", function()
         if next(model.meshToLoad) ~= nil then
@@ -583,12 +582,22 @@ else
                 meshLoadCoroutine()
             end
         end
-        if !table.isEmpty(model.networked) then
-            getNetworkedModels()
-        end
     end)
 
-    hook.add("NetworkEntityCreated", "NetworkModels", )
+    hook.add("NetworkEntityCreated", "NetworkModels", function(ent)
+        local id = ent:entIndex()
+        local toNetworkInfo = model.networked[id]
+        if !toNetworkInfo then return end
+        local mdl = model.registered[toNetworkInfo.modelId]
+        if !mdl then return end
+        mdl:create(ent)
+        modelMethodsOverride(ent)
+        for _, funcTable in ipairs(toNetworkInfo.params) do
+            if !ent[funcTable[1]] then goto cont end
+            ent[funcTable[1]](ent, unpack(funcTable[2]))
+            ::cont::
+        end
+    end)
 
     ---[CLIENT] Set this mesh to hologram
     ---@param holo Hologram Hologram to set
@@ -675,7 +684,9 @@ hook.add("EntityRemoved", "ModelRemove", function(ent, fullupdate)
                 recursiveRemove(v)
                 ::cont::
             end
-            model.networked[ent:entIndex()] = nil
+            if !fullupdate then
+                model.networked[ent:entIndex()] = nil
+            end
         end
     else
         model.toNetwork[ent:entIndex()] = nil
@@ -1094,11 +1105,6 @@ end
 ---@field offset Vector
 ---@field angle Angle
 
----@class BoneEntity: Entity
----@field identifier string Identifier of bone
----@field layers table<number, Layer> Animation layers
-
-
 ---@param origin Entity? Origin to parent
 ---@return ModelEntity?
 function ModelInfo:create(origin)
@@ -1109,12 +1115,12 @@ function ModelInfo:create(origin)
     end
     local id = originHolo:entIndex()
     if SERVER then
-        -- model.toNetwork[id] = {
-        --     modelId = self.identifier,
-        --     params = {},
-        --     paramsToSend = {}
-        -- }
-        -- model.sync()
+        model.toNetwork[id] = {
+            modelId = self.identifier,
+            params = {},
+            paramsToSend = {}
+        }
+        model.sync()
         originHolo = modelMethodsOverride(originHolo)
         originHolo.identifier = self.identifier
         originHolo.modelInfo = self
