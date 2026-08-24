@@ -87,15 +87,19 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 local ModelEntity = {}
 ModelEntity.networking = false
 
-function ModelEntity:recursiveFun(fun, ...)
-    for _, v in pairs(self.modelBones or self:getChildren()) do
+local function recursiveFun(origin, fun, ...)
+    for _, v in pairs(origin.modelBones or origin:getChildren()) do
         if isfunction(fun) then
             fun(v, ...)
         else
             if v[fun] then v[fun](v, ...) end
         end
-        self:recursiveFun(v, fun, ...)
+        recursiveFun(v, fun, ...)
     end
+end
+
+function ModelEntity:recursiveFun(fun, ...)
+    recursiveFun(self, fun, ...)
 end
 
 function ModelEntity:sendFunction(func, ...)
@@ -240,11 +244,25 @@ function ModelEntity:setSubColor(index, col)
     end)
 end
 
+local function multiplyColor(c1, c2)
+    return ((c1 / 255) * (c2 / 255)) * 255
+end
+
 ---[SHARED] Set color for this model
 ---@param col Color Color to set
 function ModelEntity:setColor(col)
+    self:__setColorOld(col)
     self:sendFunction("setColor", col)
-    self:recursiveFun("setColor", col)
+    self:recursiveFun(function(holo)
+        local initCol = holo.modelInitialColor
+        if !initCol then return end
+        holo:setColor(Color(
+            multiplyColor(initCol[1], col[1]),
+            multiplyColor(initCol[2], col[2]),
+            multiplyColor(initCol[3], col[3]),
+            col[4]
+        ))
+    end)
 end
 
 ---[SHARED] Set render FX for this model
@@ -297,39 +315,50 @@ if CLIENT then
         return vertexes, normals, faces, numVert
     end
 
+    local function recursiveObj(v, originPos, originAng, currentOffset, threading)
+        local pos, ang = worldToLocal(v:getPos(), v:getAngles(), originPos, originAng)
+        local vertexesGl, normalsGl, facesGl, offset = objFromModel(v:getModel(), pos, ang, v:getScale(), currentOffset)
+        offset = offset + currentOffset
+        for _, child in pairs(v:getChildren()) do
+            if child.modelBone then goto cont end
+            local num, vertexes, normals, faces = recursiveObj(child, originPos, originAng, offset, threading)
+            offset = num
+            vertexesGl = vertexesGl .. vertexes
+            normalsGl = normalsGl .. normals
+            facesGl = facesGl .. faces
+            ::cont::
+        end
+        if threading then coroutine.yield() end
+        return offset, vertexesGl, normalsGl, facesGl
+    end
+
     ---[CLIENT] Get OBJ with rig for Blender
+    ---@param threading boolean? Threading for it
     ---@return string mdlData
-    function ModelEntity:getObj()
+    function ModelEntity:getObj(threading)
         local objData = ""
         local boneString = ""
         local offset = 0
         local originPos, originAng = self:getPos(), self:getAngles()
         local boneInfos = self.modelInfo.bones
         for i, v in ipairs(self.modelBones) do
-            local vertexesGl = ""
-            local normalsGl = ""
-            local facesGl = ""
-            for _, child in pairs(v:getChildren()) do
-                if child == v then goto cont end
-                local pos, ang = worldToLocal(child:getPos(), child:getAngles(), originPos, originAng)
-                local vertexes, normals, faces, num = objFromModel(child:getModel(), pos, ang, child:getScale(), offset)
-                offset = offset + num
-                vertexesGl = vertexesGl .. vertexes
-                normalsGl = normalsGl .. normals
-                facesGl = facesGl .. faces
-                ::cont::
-            end
+            local num, vertexesGl, normalsGl, facesGl = recursiveObj(v, originPos, originAng, offset, threading)
+            offset = num
             local boneInfo = boneInfos[i]
             local name = boneInfo.name
             objData = objData .. "o " .. name .. vertexesGl .. normalsGl .. facesGl .. "\n"
             local parentName = boneInfo.parent
             local pos = v:getPos() / 39.37008
             local ang = v:getAngles()
-            boneString = boneString .. string.format("#%s;%s,%s,%s;%s,%s,%s;%s\n", name, pos.x, pos.y, pos.z, ang.p, ang.y, ang.r, parentName)
+            boneString = boneString .. string.format("#%s;%s,%s,%s;%s,%s,%s%s\n", name, pos.x, pos.y, pos.z, ang.p, ang.y, ang.r, parentName and ";" .. parentName or "")
         end
         return boneString .. "\n" .. objData
     end
 end
+
+---@class Layer
+---@field offset Vector
+---@field angle Angle
 
 ---@class BoneEntity: Entity
 ---@field identifier string Identifier of bone
@@ -423,7 +452,6 @@ end
 ---@param state boolean State of no draw
 function BoneEntity:setNoDraw(state)
     for _, v in pairs(self:getChildren()) do
-        if v == self then print(v) end
         v:setNoDraw(state)
     end
     self.noDraw = state
@@ -444,6 +472,7 @@ end
 ---@return ModelEntity
 local function boneMethodsOverride(ent)
     ent.offset = ent:getLocalPos()
+    ent.modelBone = true
     ent.layers = {}
     for name, v in pairs(BoneEntity) do
         local old = "__" .. name .. "Old"
@@ -936,28 +965,33 @@ end
 ---@field meshPart string? Mesh part. You can found this lines in obj file: `o name_of_part`
 ---@field clips Clip[]? Clips of holo
 ---@field cullmode number? Cull mode of holo
+---@field noColorize boolean? No colorize this holo when changing color with setColor, default false
 
-local emptyFunction = function() end
+local emptyColor = Color(255, 255, 255, 255)
+local vectorNull = Vector()
+local angleNull = Angle()
+local scaleNull = Vector(1, 1, 1)
 
 ---[SHARED] Create hologram with extended parameters. On server does nothing
 ---@param tbl HoloParameters
 ---@return modelfun
 function model.holo(tbl)
-    local pos = tbl.pos or tbl[1] or Vector()
-    local ang = tbl.ang or tbl[2] or Angle()
+    local pos = tbl.pos or tbl[1] or vectorNull
+    local ang = tbl.ang or tbl[2] or angleNull
     local mdl = tbl.model or tbl[3] or "models/holograms/cube.mdl"
-    local scale = tbl.scale or tbl[4] or Vector(1, 1, 1)
+    local scale = tbl.scale or tbl[4] or scaleNull
     local size = tbl.size or tbl[5]
     local submat = tbl.submaterial or tbl[6] or 0
     local subcol = tbl.subcolor or tbl[7] or 0
     local matName = tbl.material or tbl[8]
-    local color = tbl.color or tbl[9] or Color(255, 255, 255, 255)
+    local color = tbl.color or tbl[9] or emptyColor
     local noLight = tbl.noLight or tbl[10] or false
     local meshId = tbl.mesh or tbl[11]
     local meshPart = tbl.meshPart or tbl[12]
     local clips = tbl.clips or tbl[13] or {}
     local cullmode = tbl.cullmode or tbl[14] or 0
-    local funcToMat = emptyFunction
+    local noColorize = tbl.noColorize or tbl[15]
+    local funcToMat
     if matName then
         local function setMaterial(holo, index, funcMatName)
             local mat = model.materials[funcMatName]
@@ -985,7 +1019,7 @@ function model.holo(tbl)
         holo:suppressEngineLighting(noLight)
         holo:setCullMode(cullmode)
         if size then holo:setSize(size) end
-        funcToMat(holo)
+        if funcToMat then funcToMat(holo) end
         holo:setColor(color)
         for i, v in ipairs(clips) do
             holo:setClip(i, true, size and v[1] + size or v[1] * scale, v[2], holo)
@@ -996,6 +1030,7 @@ function model.holo(tbl)
         end
         holo.modelSubcolor = subcol
         holo.modelSubmaterial = submat
+        if !noColorize then holo.modelInitialColor = color end
         return holo
     end
 end
@@ -1101,9 +1136,6 @@ function ModelInfo:addPoseParameter(name, min, max)
     return self
 end
 
----@class Layer
----@field offset Vector
----@field angle Angle
 
 ---@param origin Entity? Origin to parent
 ---@return ModelEntity?
