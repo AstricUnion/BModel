@@ -588,7 +588,7 @@ else
         model.networked = net.readTable()
         for id, toNetworkInfo in pairs(model.networked) do
             local ent = entity(id)
-            if !isValid(ent) then goto cont end
+            if !isValid(ent) or ent.modelBones then goto cont end
             local mdl = model.registered[toNetworkInfo.modelId]
             if !mdl then goto cont end
             mdl:create(ent)
@@ -708,12 +708,12 @@ end
 hook.add("EntityRemoved", "ModelRemove", function(ent, fullupdate)
     if CLIENT then
         if isValid(ent) and ent.modelBones then
-            for _, v in ipairs(ent.modelBones) do
-                if !isValid(v) then goto cont end
-                recursiveRemove(v)
-                ::cont::
-            end
             if !fullupdate then
+                for _, v in ipairs(ent.modelBones) do
+                    if !isValid(v) then goto cont end
+                    recursiveRemove(v)
+                    ::cont::
+                end
                 model.networked[ent:entIndex()] = nil
             end
         end
