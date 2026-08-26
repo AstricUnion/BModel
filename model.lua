@@ -79,27 +79,44 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 ---@field process fun(process: number): boolean Relative to curtime
 
 ---@class ModelEntity: Entity
----@field identifier string Identifier of model
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
 ---@field sequences table<number, Sequence> [CLIENT] Layers of sequences
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
+---@field color Color Color of model entity
+---@field material string Material of model entity
+---@field submaterials table<number, string> Current submaterials of entity
+---@field renderFX number RENDERFX enum
+---@field noDraw boolean No draw this entity
 local ModelEntity = {}
 ModelEntity.networking = false
 
 local function recursiveFun(origin, fun, ...)
-    for _, v in pairs(origin.modelBones or origin:getChildren()) do
+    for _, v in pairs(origin:getChildren()) do
+        if v:getClass() ~= "starfall_hologram" then goto cont end
         if isfunction(fun) then
             fun(v, ...)
         else
             if v[fun] then v[fun](v, ...) end
         end
         recursiveFun(v, fun, ...)
+        ::cont::
     end
 end
 
 function ModelEntity:recursiveFun(fun, ...)
-    recursiveFun(self, fun, ...)
+    for _, v in pairs(CLIENT and self.modelBones or self:getChildren()) do
+        if v:getClass() ~= "starfall_hologram" then goto cont end
+        if isfunction(fun) then
+            fun(v, ...)
+        else
+            if v[fun] then v[fun](v, ...) end
+        end
+        if SERVER then
+            recursiveFun(v, fun, ...)
+        end
+        ::cont::
+    end
 end
 
 function ModelEntity:sendFunction(func, ...)
@@ -126,28 +143,6 @@ function ModelEntity:sendFunction(func, ...)
     end)
 end
 
-function ModelEntity:setNoDraw(state)
-    self.noDraw = state
-    self:sendFunction("setNoDraw", state)
-    self:recursiveFun(function(holo)
-        if holo:getModel() == model.rigModel then
-            holo:setNoDraw(holo:getNoDraw())
-            return
-        end
-        holo:setNoDraw(state)
-    end)
-end
-
-function ModelEntity:getNoDraw()
-    return self.noDraw
-end
-
-function ModelEntity:setCullMode(state)
-    for _, v in pairs(self:getChildren()) do
-        v:setCullMode(state)
-    end
-end
-
 ---[SHARED] Lookup for bone in entity
 ---@param name string Name of the bone
 ---@return number id
@@ -162,7 +157,7 @@ function ModelEntity:lookupSequence(name)
     return self.modelInfo.sequencesIDs[name] or -1
 end
 
----[SHARED] Returns currself entity sequence
+---[SHARED] Returns current entity sequence
 ---@param layer number? Layer of animation
 ---@return number id
 function ModelEntity:getSequence(layer)
@@ -194,18 +189,18 @@ function ModelEntity:setSequence(id, layerId, time)
     end
 end
 
----[SHARED] Returns currself entity pose parameter
+---[SHARED] Returns current entity pose parameter
 ---@param name string Name of pose parameter
 ---@return number value
-function ModelEntity:getPoseParameter(name)
+function ModelEntity:getPose(name)
     return self.poseParameters[name] or 0
 end
 
 ---[SHARED] Set pose parameter for this entity
 ---@param name string Name of pose parameter
 ---@param value number Value to set
-function ModelEntity:setPoseParameter(name, value)
-    self:sendFunction("setPoseParameter", name, value)
+function ModelEntity:setPose(name, value)
+    self:sendFunction("setPose", name, value)
     if CLIENT then
         local param = self.modelInfo.poseParameters[name]
         if !param then return end
@@ -213,63 +208,8 @@ function ModelEntity:setPoseParameter(name, value)
     end
 end
 
----[SHARED] Set submaterial for this model
----@param index number Submaterial index. 0 is default for all
----@param mat string Material to set
-function ModelEntity:setSubMaterial(index, mat)
-    self:sendFunction("setSubMaterial", index, mat)
-    self:recursiveFun(index ~= -1 and function(holo)
-        if holo.modelSubmaterial == index then
-            holo:setSubMaterial(0, mat)
-        end
-    end)
-end
-
----[SHARED] Set main material for this model
----@param mat string Material to set
-function ModelEntity:setMaterial(mat)
-    self:sendFunction("setMaterial", mat)
-    self:recursiveFun("setSubMaterial", 0, mat)
-end
-
----[SHARED] Set subcolor for this model
----@param index number Color index. 0 is default for all
----@param col Color Color to set
-function ModelEntity:setSubColor(index, col)
-    self:sendFunction("setSubColor", index, col)
-    self:recursiveFun(function(holo)
-        if holo.modelSubcolor == index then
-            holo:setColor(col)
-        end
-    end)
-end
-
 local function multiplyColor(c1, c2)
     return ((c1 / 255) * (c2 / 255)) * 255
-end
-
----[SHARED] Set color for this model
----@param col Color Color to set
-function ModelEntity:setColor(col)
-    self:__setColorOld(col)
-    self:sendFunction("setColor", col)
-    self:recursiveFun(function(holo)
-        local initCol = holo.modelInitialColor
-        if !initCol then return end
-        holo:setColor(Color(
-            multiplyColor(initCol[1], col[1]),
-            multiplyColor(initCol[2], col[2]),
-            multiplyColor(initCol[3], col[3]),
-            col[4]
-        ))
-    end)
-end
-
----[SHARED] Set render FX for this model
----@param renderFx number Render FX. RENDERFX enum
-function ModelEntity:setRenderFX(renderFx)
-    self:sendFunction("setRenderFX", renderFx)
-    self:recursiveFun("setRenderFX", renderFx)
 end
 
 if CLIENT then
@@ -356,6 +296,44 @@ if CLIENT then
     end
 end
 
+hook.add("Think", "ModelEntityParameterUpdateBones", function()
+    for _, ent in pairs(model.inited) do
+        if !isValid(ent) then goto cont end
+        local col = ent:getColor()
+        if ent.color ~= col then
+            ent:recursiveFun("setColor", col)
+            ent.color = col
+        end
+
+        local mat = ent:getMaterial()
+        if ent.material ~= mat then
+            ent:recursiveFun("setMaterial", mat)
+            ent.material = mat
+        end
+
+        for i=1, ent.modelInfo.submaterialCount do
+            local submaterial = ent:getSubMaterial(i)
+            if ent.submaterials[i] ~= submaterial then
+                ent:recursiveFun("setSubMaterial", i, mat)
+                ent.submaterials[i] = submaterial
+            end
+        end
+
+        local renderFX = ent:getRenderFX()
+        if ent.renderFX ~= renderFX then
+            ent:recursiveFun("setRenderFX", renderFX)
+            ent.renderFX = renderFX
+        end
+
+        local noDraw = ent:getNoDraw()
+        if ent.noDraw ~= noDraw then
+            ent:recursiveFun("setNoDraw", noDraw)
+            ent.noDraw = noDraw
+        end
+        ::cont::
+    end
+end)
+
 ---@class Layer
 ---@field offset Vector
 ---@field angle Angle
@@ -365,6 +343,10 @@ end
 ---@field layers table<number, Layer> Animation layers
 ---@field offset Vector Initial offset of bone
 local BoneEntity = {}
+
+function BoneEntity:recursiveFun(fun, ...)
+    recursiveFun(self, fun, ...)
+end
 
 ---[CLIENT] Set local to parent position for layer for animations
 ---@param layer number Layer to set
@@ -451,25 +433,85 @@ end
 ---[CLIENT] Set no draw for entire bone
 ---@param state boolean State of no draw
 function BoneEntity:setNoDraw(state)
-    for _, v in pairs(self:getChildren()) do
-        v:setNoDraw(state)
-    end
-    self.noDraw = state
+    self:recursiveFun("setNoDraw", state)
+    self.noDraw = true
     if !self.modelRig then
         self:__setNoDrawOld(state)
+    end
+end
+
+---[SHARED] Set submaterial for this model
+---@param index number Submaterial index. 0 is default for all
+---@param mat string Material to set
+function BoneEntity:setSubMaterial(index, mat)
+    self:recursiveFun(function(holo)
+        if holo.modelSubmaterial == index then
+            holo:setMaterial(mat)
+        end
+    end)
+end
+
+---[SHARED] Set main material for this model
+---@param mat string Material to set
+function BoneEntity:setMaterial(mat)
+    self:recursiveFun("setMaterial", mat)
+end
+
+
+---[SHARED] Set color for this bone
+---@param col Color Color to set
+function BoneEntity:setColor(col)
+    self:recursiveFun(function(holo)
+        local initCol = holo.modelInitialColor
+        if !initCol then return end
+        holo:setColor(Color(
+            multiplyColor(initCol[1], col[1]),
+            multiplyColor(initCol[2], col[2]),
+            multiplyColor(initCol[3], col[3]),
+            col[4]
+        ))
+    end)
+    if !self.modelRig then
+        local initCol = self.modelInitialColor
+        if !initCol then return end
+        self:__setColorOld(Color(
+            multiplyColor(initCol[1], col[1]),
+            multiplyColor(initCol[2], col[2]),
+            multiplyColor(initCol[3], col[3]),
+            col[4]
+        ))
     end
 end
 
 ---[CLIENT] Get no draw for bone
 ---@return boolean state State of no draw
 function BoneEntity:getNoDraw()
-    return self.noDraw
+    return self.noDraw == true
+end
+
+
+---Override methods of entity to work with models
+---@param self ModelInfo
+---@param ent Entity
+---@return ModelEntity
+local function modelMethodsOverride(self, ent)
+    ent.modelInfo = self
+    ent.sequences = {}
+    ent.poseParameters = {}
+    for name, v in pairs(ModelEntity) do
+        local old = "__" .. name .. "Old"
+        ent[old] = ent[old] or ent[name]
+        ent[name] = v
+    end
+    ---@cast ent ModelEntity
+
+    return ent
 end
 
 
 ---Override methods of entity to work with models (as bone)
 ---@param ent Entity
----@return ModelEntity
+---@return BoneEntity
 local function boneMethodsOverride(ent)
     ent.offset = ent:getLocalPos()
     ent.modelBone = true
@@ -485,19 +527,6 @@ local function boneMethodsOverride(ent)
 end
 
 
----Override methods of entity to work with models
----@param ent Entity
----@return ModelEntity
-local function modelMethodsOverride(ent)
-    for name, v in pairs(ModelEntity) do
-        local old = "__" .. name .. "Old"
-        ent[old] = ent[old] or ent[name]
-        ent[name] = v
-    end
-    ---@cast ent ModelEntity
-
-    return ent
-end
 
 if SERVER then
     ---[SERVER] Sync holograms to clients
@@ -584,21 +613,31 @@ else
         end
     end)
 
+    local emptyMesh = mesh.createEmpty()
+
+    local function createAfterNetworking(ent, toNetworkInfo)
+        if !isValid(ent) or ent.modelBones or !toNetworkInfo then return end
+        local mdl = model.registered[toNetworkInfo.modelId]
+        if !mdl then return end
+        local class = ent:getClass()
+        if (class == "starfall_prop" or class == "starfall_hologram") and ent:getRenderMode() == RENDERMODE.NONE then
+            ent:setMesh(emptyMesh)
+            ent:setRenderMode(RENDERMODE.NORMAL)
+        end
+        mdl:create(ent)
+        modelMethodsOverride(mdl, ent)
+        for _, funcTable in ipairs(toNetworkInfo.params) do
+            if !ent[funcTable[1]] then goto cont end
+            ent[funcTable[1]](ent, unpack(funcTable[2]))
+            ::cont::
+        end
+    end
+
     net.receive("NetworkModels", function()
         model.networked = net.readTable()
         for id, toNetworkInfo in pairs(model.networked) do
             local ent = entity(id)
-            if !isValid(ent) or ent.modelBones then goto cont end
-            local mdl = model.registered[toNetworkInfo.modelId]
-            if !mdl then goto cont end
-            mdl:create(ent)
-            modelMethodsOverride(ent)
-            for _, funcTable in ipairs(toNetworkInfo.params) do
-                if !ent[funcTable[1]] then goto cont end
-                ent[funcTable[1]](ent, unpack(funcTable[2]))
-                ::cont::
-            end
-            ::cont::
+            createAfterNetworking(ent, toNetworkInfo)
         end
     end)
 
@@ -616,16 +655,7 @@ else
     hook.add("NetworkEntityCreated", "NetworkModels", function(ent)
         local id = ent:entIndex()
         local toNetworkInfo = model.networked[id]
-        if !toNetworkInfo then return end
-        local mdl = model.registered[toNetworkInfo.modelId]
-        if !mdl then return end
-        mdl:create(ent)
-        modelMethodsOverride(ent)
-        for _, funcTable in ipairs(toNetworkInfo.params) do
-            if !ent[funcTable[1]] then goto cont end
-            ent[funcTable[1]](ent, unpack(funcTable[2]))
-            ::cont::
-        end
+        createAfterNetworking(ent, toNetworkInfo)
     end)
 
     ---[CLIENT] Set this mesh to hologram
@@ -861,9 +891,10 @@ function model.hitbox(tbl)
         local pr = prop.createCustom(Vector(), Angle(), vertexes, true)
         local phys = pr:getPhysicsObject()
         pr:setFrozen(freeze)
-        pr:setNoDraw(!visible)
+        -- pr:setNoDraw(!visible)
         pr.buoyancyRatio = buoyancyRatio
         timer.simple(0, function()
+            pr:setRenderMode(RENDERMODE.NONE)
             if !isValid(phys) then return end
             phys:setMass(mass)
             phys:setMaterial(mat)
@@ -912,6 +943,16 @@ local partCreateHolosCoroutine = coroutine.wrap(function(...)
                 if !holo then goto cont end
                 local offset = holo:getLocalPos()
                 local ang = holo:getLocalAngles()
+                local initCol = holo.modelInitialColor
+                if initCol then
+                    local col = v[2]:getColor()
+                    holo:setColor(Color(
+                        multiplyColor(initCol[1], col[1]),
+                        multiplyColor(initCol[2], col[2]),
+                        multiplyColor(initCol[3], col[3]),
+                        col[4]
+                    ))
+                end
                 holo:setNoDraw(v[2]:getNoDraw())
                 holo:setParent(v[2])
                 holo:setLocalPos(offset)
@@ -1060,6 +1101,7 @@ end
 ---@field sequences ModelSequence[]
 ---@field sequencesIDs table<string, number>
 ---@field poseParameters table<string, PoseParameter>
+---@field submaterialCount number
 ---@field identifier string
 local ModelInfo = {}
 ModelInfo.__index = ModelInfo
@@ -1072,7 +1114,7 @@ ModelInfo.__index = ModelInfo
 function model.new(identifier, origin)
     local rig = isfunction(origin) and origin or model.rig(origin)
     local obj = setmetatable(
-        { origin = rig, bones = {}, bonesIDs = {}, sequences = {}, sequencesIDs = {}, identifier = identifier, poseParameters = {} },
+        { origin = rig, bones = {}, bonesIDs = {}, sequences = {}, sequencesIDs = {}, identifier = identifier, poseParameters = {}, submaterialCount = 0 },
         ModelInfo
     )
     model.registered[identifier] = obj
@@ -1153,11 +1195,7 @@ function ModelInfo:create(origin)
             paramsToSend = {}
         }
         model.sync()
-        originHolo = modelMethodsOverride(originHolo)
-        originHolo.identifier = self.identifier
-        originHolo.modelInfo = self
-        originHolo.sequences = {}
-        originHolo.poseParameters = {}
+        originHolo = modelMethodsOverride(self, originHolo)
         model.inited[id] = originHolo
         return originHolo
     end
@@ -1167,6 +1205,7 @@ function ModelInfo:create(origin)
         if !part then goto cont end
         local holo = part.bone()
         if !holo then goto cont end
+        holo.identifier = part.name
         boneMethodsOverride(holo)
         bones[i] = holo
         local parent = part.parent
@@ -1181,13 +1220,8 @@ function ModelInfo:create(origin)
         holo:setParent(parentHolo)
         ::cont::
     end
-    -- i will remove repeating code, i promise
-    originHolo = modelMethodsOverride(originHolo)
-    originHolo.identifier = self.identifier
+    originHolo = modelMethodsOverride(self, originHolo)
     originHolo.modelBones = bones
-    originHolo.modelInfo = self
-    originHolo.sequences = {}
-    originHolo.poseParameters = {}
     model.inited[id] = originHolo
     return originHolo
 end
