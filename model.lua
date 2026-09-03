@@ -42,6 +42,38 @@ if CLIENT then
     end
 end
 
+---@class BoneMatrix
+---@field [1] Vector
+---@field [2] Angle
+
+---@class Keyframes
+---@field frames BoneMatrix[]
+local Keyframes = {}
+Keyframes.__index = Keyframes
+
+---@param frames BoneMatrix[]
+function Keyframes:new(frames)
+    return setmetatable(
+        {frames = frames},
+        Keyframes
+    )
+end
+
+function Keyframes:getFrame(process)
+    local frame = process * 24
+    local count = #self.frames
+    process = math.max(frame - (math.floor(frame / count) * count), 1)
+    local frame1 = math.floor(process)
+    local frame2 = math.ceil(process)
+    local ratio = process - frame1
+    if frame2 >= count then
+        frame2 = math.floor(ratio + 1)
+    end
+    local matrix1 = self.frames[frame1]
+    local matrix2 = self.frames[frame2]
+    return {math.lerpVector(ratio, matrix1[1], matrix2[1]), math.lerpAngle(ratio, matrix1[2], matrix2[2])}
+end
+
 
 ---@class ToNetwork
 ---@field modelId string Identifier of model
@@ -71,10 +103,13 @@ model.rigVisible = false
 model.rigModel = "models/editor/axis_helper_thick.mdl"
 
 ---@alias modelfun fun(): (Entity?)
+---@alias Animation table<number, Keyframes>
 
 ---@class ModelEntity: Entity
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
+---@field sequence number? [CLIENT] Current animation for this entity
+---@field startedAt number? [CLIENT] When animation started
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
 ---@field color Color Color of model entity
 ---@field material string Material of model entity
@@ -148,6 +183,22 @@ end
 ---@return number id
 function ModelEntity:lookupSequence(name)
     return self.modelInfo.sequencesIDs[name] or -1
+end
+
+---[SHARED] Set sequence for this entity
+---@param id number Sequence ID
+function ModelEntity:setSequence(id)
+    self:sendFunction("setSequence", id)
+    if CLIENT then
+        local seq = self.modelInfo.sequences[id]
+        if !seq then
+            self.sequence = nil
+            self.startedAt = nil
+            return
+        end
+        self.sequence = id
+        self.startedAt = timer.curtime()
+    end
 end
 
 ---[SHARED] Returns current entity pose parameter
@@ -257,40 +308,63 @@ if CLIENT then
     end
 end
 
+local function updateParameters(ent)
+    local col = ent:getColor()
+    if ent.color ~= col then
+        ent:recursiveFun("setColor", col)
+        ent.color = col
+    end
+
+    local mat = ent:getMaterial()
+    if ent.material ~= mat then
+        ent:recursiveFun("setMaterial", mat)
+        ent.material = mat
+    end
+
+    for i=1, ent.modelInfo.submaterialCount do
+        local submaterial = ent:getSubMaterial(i)
+        if ent.submaterials[i] ~= submaterial then
+            ent:recursiveFun("setSubMaterial", i, mat)
+            ent.submaterials[i] = submaterial
+        end
+    end
+
+    local renderFX = ent:getRenderFX()
+    if ent.renderFX ~= renderFX then
+        ent:recursiveFun("setRenderFX", renderFX)
+        ent.renderFX = renderFX
+    end
+
+    local noDraw = ent:getNoDraw()
+    if ent.noDraw ~= noDraw then
+        ent:recursiveFun("setNoDraw", noDraw)
+        ent.noDraw = noDraw
+    end
+end
+
+local zero = {Vector(), Angle()}
+
+
+---@param ent ModelEntity
+local function sequenceThink(ent)
+    if !CLIENT or !ent.sequence then return end
+    local modelInfo = ent.modelInfo
+    local anim = modelInfo.sequences[ent.sequence]
+    local process = timer.curtime() - ent.startedAt
+    for bone, _ in ipairs(modelInfo.bones) do
+        local keyframes = anim[bone]
+        local frame = keyframes and keyframes:getFrame(process) or zero
+        local boneEntity = ent.modelBones[bone]
+        boneEntity:setLocalPos(frame[1])
+        boneEntity:setLocalAngles(frame[2])
+    end
+end
+
 hook.add("Think", "ModelEntityParameterUpdateBones", function()
     for _, ent in pairs(model.inited) do
         if !isValid(ent) then goto cont end
-        local col = ent:getColor()
-        if ent.color ~= col then
-            ent:recursiveFun("setColor", col)
-            ent.color = col
-        end
-
-        local mat = ent:getMaterial()
-        if ent.material ~= mat then
-            ent:recursiveFun("setMaterial", mat)
-            ent.material = mat
-        end
-
-        for i=1, ent.modelInfo.submaterialCount do
-            local submaterial = ent:getSubMaterial(i)
-            if ent.submaterials[i] ~= submaterial then
-                ent:recursiveFun("setSubMaterial", i, mat)
-                ent.submaterials[i] = submaterial
-            end
-        end
-
-        local renderFX = ent:getRenderFX()
-        if ent.renderFX ~= renderFX then
-            ent:recursiveFun("setRenderFX", renderFX)
-            ent.renderFX = renderFX
-        end
-
-        local noDraw = ent:getNoDraw()
-        if ent.noDraw ~= noDraw then
-            ent:recursiveFun("setNoDraw", noDraw)
-            ent.noDraw = noDraw
-        end
+        updateParameters(ent)
+        sequenceThink(ent)
         ::cont::
     end
 end)
@@ -945,6 +1019,7 @@ end
 ---@field bonesIDs table<string, number>
 ---@field sequencesIDs table<string, number>
 ---@field poseParameters table<string, PoseParameter>
+---@field sequences Animation[]
 ---@field submaterialCount number
 ---@field identifier string
 local ModelInfo = {}
@@ -963,10 +1038,10 @@ function model.new(identifier, origin)
             bones = {},
             bonesIDs = {},
             sequencesIDs = {},
+            sequences = {},
             identifier = identifier,
             poseParameters = {},
             submaterialCount = 0,
-            frames = {}
         },
         ModelInfo
     )
@@ -1012,6 +1087,37 @@ function ModelInfo:addPoseParameter(name, min, max)
         min = min or -32768,
         max = max or 32768
     }
+    return self
+end
+
+---@class RawKeyframe
+---@field [1] string Name of the bone
+---@field [2] Vector Position
+---@field [3] Angle Angles
+
+---[SHARED] Add sequence to model
+---@param name string Identifier of sequence
+---@param frames RawKeyframe[][]
+---@return ModelInfo
+function ModelInfo:addSequence(name, frames)
+    local id = #self.sequences+1
+    ---@type Animation
+    local newFrames = {}
+    for i, v in ipairs(frames) do
+        for _, bone in ipairs(v) do
+            local boneId = self.bonesIDs[bone[1]]
+            if !boneId then goto cont end
+            local keyframes = newFrames[boneId] or {}
+            newFrames[boneId] = keyframes
+            keyframes[i] = {bone[2], bone[3]}
+            ::cont::
+        end
+    end
+    for i, v in pairs(newFrames) do
+        newFrames[i] = Keyframes:new(v)
+    end
+    self.sequences[id] = newFrames
+    self.sequencesIDs[name] = id
     return self
 end
 
