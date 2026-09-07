@@ -1,6 +1,8 @@
 ---@name Model
 ---@author AstricUnion
 
+-- Beautiful, but no efficiency
+-- TODO: made method without million functions
 
 -- implement client parents for holograms
 if CLIENT then
@@ -47,33 +49,74 @@ end
 ---@field [2] Angle
 
 ---@class Keyframes
----@field frames BoneMatrix[]
+---@field frames BoneMatrix[] Frames of animation
+---@field fps number FPS of animation. By default is 30
+---@field length number Length of animation
+---@field lastProcess number Last handled process
+---@field mat1 BoneMatrix First bone matrix on last process
+---@field mat2 BoneMatrix Second bone matrix on last process
 local Keyframes = {}
 Keyframes.__index = Keyframes
 
 ---@param frames BoneMatrix[]
-function Keyframes:new(frames)
+---@param fps number?
+function Keyframes:new(frames, fps)
     return setmetatable(
-        {frames = frames},
+        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0},
         Keyframes
     )
 end
 
 function Keyframes:getFrame(process)
-    local frame = process * 24
-    local count = #self.frames
-    process = math.max(frame - (math.floor(frame / count) * count), 1)
-    local frame1 = math.floor(process)
-    local frame2 = math.ceil(process)
-    local ratio = process - frame1
-    if frame2 >= count then
-        frame2 = math.floor(ratio + 1)
+    local count = self.length
+    if count == 1 then
+        return self.frames[1]
     end
-    local matrix1 = self.frames[frame1]
-    local matrix2 = self.frames[frame2]
+    local frame = process * self.fps + 1
+    process = math.clamp(frame, 1, count)
+    local frame1 = math.floor(process)
+    local ratio = process - frame1
+    local matrix1, matrix2
+    if frame1 ~= self.lastProcess then
+        local frame2 = math.ceil(process)
+        matrix1 = self.frames[frame1]
+        matrix2 = self.frames[frame2]
+        self.mat1, self.mat2 = matrix1, matrix2
+        self.lastProcess = frame1
+    else
+        matrix1, matrix2 = self.mat1, self.mat2
+    end
     return {math.lerpVector(ratio, matrix1[1], matrix2[1]), math.lerpAngle(ratio, matrix1[2], matrix2[2])}
 end
 
+---@enum ANIMBLEND
+local ANIMBLEND = {
+    ADD = function(weight, mat1, mat2)
+        local pos = weight == 1 and mat2[1] or math.lerpVector(weight, zero[1], mat2[1])
+        local ang = weight == 1 and mat2[1] or math.lerpAngle(weight, zero[2], mat2[1])
+        return {
+            mat1[1] + pos,
+            mat1[2] + ang
+        }
+    end,
+    LINEAR = function(weight, mat1, mat2)
+        return {
+            weight == 1 and mat2[1] or math.lerpVector(weight, mat1[1], mat2[1]),
+            weight == 1 and mat2[2] or math.lerpAngle(weight, mat1[2], mat2[2])
+        }
+    end,
+}
+
+---@class AnimationLayer
+---@field startedAt number Time this layer started at
+---@field length number Length of animation
+---@field loop boolean Loop this layer
+---@field pause boolean Pause this layer
+---@field blend ANIMBLEND Blending method
+---@field frames Animation Animation to play on this layer
+---@field weight number Weight of this layer
+---@field fadeIn number How long fade this layer in. By default is 0.2
+---@field fadeOut number How long fade this layer out. By default is 0.2
 
 ---@class ToNetwork
 ---@field modelId string Identifier of model
@@ -108,7 +151,7 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 ---@class ModelEntity: Entity
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
----@field sequence number? [CLIENT] Current animation for this entity
+---@field layers AnimationLayer[] [CLIENT] Animation layers
 ---@field startedAt number? [CLIENT] When animation started
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
 ---@field color Color Color of model entity
@@ -192,12 +235,20 @@ function ModelEntity:setSequence(id)
     if CLIENT then
         local seq = self.modelInfo.sequences[id]
         if !seq then
-            self.sequence = nil
-            self.startedAt = nil
+            self.layers[1] = nil
             return
         end
-        self.sequence = id
-        self.startedAt = timer.curtime()
+        self.layers[1] = {
+            frames = seq.animation,
+            startedAt = timer.curtime(),
+            loop = seq.loop,
+            fadeIn = seq.fadeIn,
+            fadeOut = seq.fadeOut,
+            length = seq.length,
+            blend = ANIMBLEND.LINEAR,
+            pause = false,
+            weight = 0
+        }
     end
 end
 
@@ -347,16 +398,39 @@ local zero = {Vector(), Angle()}
 
 ---@param ent ModelEntity
 local function sequenceThink(ent)
-    if !CLIENT or !ent.sequence then return end
+    if !CLIENT then return end
     local modelInfo = ent.modelInfo
-    local anim = modelInfo.sequences[ent.sequence]
-    local process = timer.curtime() - ent.startedAt
-    for bone, _ in ipairs(modelInfo.bones) do
-        local keyframes = anim[bone]
-        local frame = keyframes and keyframes:getFrame(process) or zero
+    local bones = modelInfo.bones
+    local cur = timer.curtime()
+    ---@type table<number, BoneMatrix>
+    local boneMatrixes = {}
+    local boneCount = #modelInfo.bones
+    for _, layer in pairs(ent.layers) do
+        local process = cur - layer.startedAt
+        local len = layer.length
+        if layer.loop and process >= len then
+            layer.startedAt = cur
+            process = process - len
+        end
+        local fadeIn = math.clamp(process / layer.fadeIn, 0, 1)
+        local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
+        local weight = fadeIn
+        local method = layer.blend
+        local anim = layer.frames
+        for bone=1, boneCount do
+            local keyframes = anim[bone]
+            local frame = keyframes and keyframes:getFrame(process)
+            local lastMatrix = boneMatrixes[bone]
+            boneMatrixes[bone] = method(weight, lastMatrix and lastMatrix or zero, frame)
+        end
+    end
+    for bone=1, boneCount do
         local boneEntity = ent.modelBones[bone]
-        boneEntity:setLocalPos(frame[1])
-        boneEntity:setLocalAngles(frame[2])
+        local matrix = boneMatrixes[bone]
+        if !matrix then goto cont end
+        boneEntity:setLocalPos(bones[bone].offset + matrix[1])
+        boneEntity:setLocalAngles(matrix[2])
+        ::cont::
     end
 end
 
@@ -448,7 +522,9 @@ end
 ---@param ent Entity
 ---@return ModelEntity
 local function modelMethodsOverride(self, ent)
+    ---@cast ent ModelEntity
     ent.modelInfo = self
+    ent.layers = {}
     for name, v in pairs(ModelEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -464,9 +540,8 @@ end
 ---@param ent Entity
 ---@return BoneEntity
 local function boneMethodsOverride(ent)
-    ent.offset = ent:getLocalPos()
+    ---@cast ent BoneEntity
     ent.modelBone = true
-    ent.layers = {}
     for name, v in pairs(BoneEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -1006,20 +1081,27 @@ function model.holo(tbl)
 end
 
 
+---@class Sequence
+---@field animation Animation
+---@field loop boolean
+---@field fadeIn number
+---@field fadeOut number
+---@field length number
 
 ---@class Bone
 ---@field parent string
 ---@field bone modelfun
 ---@field name string
----@field noDraw boolean
+---@field offset Vector
 
 ---@class ModelInfo
 ---@field origin fun()
 ---@field bones Bone[]
 ---@field bonesIDs table<string, number>
 ---@field sequencesIDs table<string, number>
+---@field sequences Sequence[]
+---@field animations table<string, Animation>
 ---@field poseParameters table<string, PoseParameter>
----@field sequences Animation[]
 ---@field submaterialCount number
 ---@field identifier string
 local ModelInfo = {}
@@ -1039,6 +1121,7 @@ function model.new(identifier, origin)
             bonesIDs = {},
             sequencesIDs = {},
             sequences = {},
+            animations = {},
             identifier = identifier,
             poseParameters = {},
             submaterialCount = 0,
@@ -1050,29 +1133,20 @@ function model.new(identifier, origin)
 end
 
 ---[SHARED] Add new bone to model
----@param parent string Identifier of bone to parent
----@param bone string|modelfun Identifier of bone
----@param mdl modelfun? Function to create model
+---@param bone string Identifier of bone
+---@param offset Vector Offset of bone. Need for animation
+---@param mdl modelfun Function to create model
+---@param parent string? Identifier of bone to parent
 ---@return ModelInfo
-function ModelInfo:add(parent, bone, mdl)
-    local outName
-    local outModel
-    local outParent
-    if !mdl then
-        outName = parent
-        outModel = bone
-    else
-        outParent = parent
-        outName = bone
-        outModel = mdl
-    end
+function ModelInfo:add(bone, offset, mdl, parent)
     local id = #self.bones+1
     self.bones[id] = {
-        name = outName,
-        parent = outParent,
-        bone = outModel
+        name = bone,
+        parent = parent,
+        bone = mdl,
+        offset = offset
     }
-    self.bonesIDs[outName] = id
+    self.bonesIDs[bone] = id
     return self
 end
 
@@ -1090,34 +1164,92 @@ function ModelInfo:addPoseParameter(name, min, max)
     return self
 end
 
+---@class Range
+---@field [1] number
+---@field [2] number
+
+---@alias Weightlist table<string, number>
+
 ---@class RawKeyframe
 ---@field [1] string Name of the bone
 ---@field [2] Vector Position
 ---@field [3] Angle Angles
 
----[SHARED] Add sequence to model
----@param name string Identifier of sequence
----@param frames RawKeyframe[][]
+---@class AnimationParameters
+---@field [1] RawKeyframe[][] Keyframes
+---@field fps number? Frame Per Second. By default is 30
+---@field frames Range? Frame range
+---@field weightlist Weightlist? Weightlist of bones
+
+
+---[SHARED] Add animation to model. You can't start animation, but you can use it for sequence
+---@param name string Identifier of animation
+---@param params AnimationParameters
 ---@return ModelInfo
-function ModelInfo:addSequence(name, frames)
-    local id = #self.sequences+1
+function ModelInfo:addAnimation(name, params)
+    local frames = params[1]
+    local currentCount = #frames
+    local min, max
+    if params.frames then
+        min, max = params.frames[1], math.min(params.frames[2], currentCount)
+    else
+        min, max = 1, currentCount
+    end
+    local weightlist = params.weightlist or {}
     ---@type Animation
     local newFrames = {}
-    for i, v in ipairs(frames) do
+    local bonesIDs = self.bonesIDs
+    local bones = self.bones
+    local vectorZero, angleZero = Vector(), Angle()
+    for i=min, max do
+        local v = frames[i]
+        local frameTime = (i - min) + 1
         for _, bone in ipairs(v) do
-            local boneId = self.bonesIDs[bone[1]]
+            local boneId = bonesIDs[bone[1]]
             if !boneId then goto cont end
+            local weight = weightlist[bone[1]] or 1
             local keyframes = newFrames[boneId] or {}
             newFrames[boneId] = keyframes
-            keyframes[i] = {bone[2], bone[3]}
+            local offset = bones[boneId].offset
+            keyframes[frameTime] = {
+                math.lerpVector(weight, vectorZero, bone[2] - offset),
+                math.lerpAngle(weight, angleZero, bone[3])
+            }
             ::cont::
         end
     end
+    local fps = params.fps
     for i, v in pairs(newFrames) do
-        newFrames[i] = Keyframes:new(v)
+        newFrames[i] = Keyframes:new(v, fps)
     end
-    self.sequences[id] = newFrames
+    self.animations[name] = newFrames
+    return self
+end
+
+
+---@class SequenceParameters
+---@field [1] string Animation
+---@field loop boolean? Loop animation
+---@field fadeIn number? Fade in
+---@field fadeOut number? Fade out
+
+
+---[SHARED] Add sequence to model
+---@param name string Identifier of sequence
+---@param params SequenceParameters
+---@return ModelInfo
+function ModelInfo:addSequence(name, params)
+    local id = #self.sequences+1
     self.sequencesIDs[name] = id
+    local anim = self.animations[params[1]]
+    local len = anim[1].length / anim[1].fps
+    self.sequences[id] = {
+        animation = anim,
+        length = len,
+        fadeIn = params.fadeIn or 0.2,
+        fadeOut = params.fadeOut or 0.2,
+        loop = params.loop or false
+    }
     return self
 end
 
