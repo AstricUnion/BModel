@@ -89,14 +89,15 @@ function Keyframes:getFrame(process)
     return {math.lerpVector(ratio, matrix1[1], matrix2[1]), math.lerpAngle(ratio, matrix1[2], matrix2[2])}
 end
 
+
+local zero = {Vector(), Angle()}
+
 ---@enum ANIMBLEND
 local ANIMBLEND = {
     ADD = function(weight, mat1, mat2)
-        local pos = weight == 1 and mat2[1] or math.lerpVector(weight, zero[1], mat2[1])
-        local ang = weight == 1 and mat2[1] or math.lerpAngle(weight, zero[2], mat2[1])
         return {
-            mat1[1] + pos,
-            mat1[2] + ang
+            mat1[1] + mat2[1],
+            mat1[2] + mat2[2]
         }
     end,
     LINEAR = function(weight, mat1, mat2)
@@ -245,9 +246,42 @@ function ModelEntity:setSequence(id)
             fadeIn = seq.fadeIn,
             fadeOut = seq.fadeOut,
             length = seq.length,
-            blend = ANIMBLEND.LINEAR,
+            blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
             pause = false,
             weight = 0
+        }
+    end
+end
+
+---[SHARED] Adds a gesture animation to the entity and plays it.
+---@param id number Sequence ID
+---@param autokill boolean? Autokill it when it fully play
+---@return number? layerId
+function ModelEntity:addGestureSequence(id, autokill)
+    self:sendFunction("addGestureSequence", id, autokill)
+    if CLIENT then
+        local seq = self.modelInfo.sequences[id]
+        local layerId
+        for i=3, 17 do
+            if !self.layers[i] then
+                layerId = i + 1
+                break
+            end
+        end
+        if !layerId then
+            throw("Gesture layers overflow")
+            return
+        end
+        self.layers[layerId] = {
+            frames = seq.animation,
+            startedAt = timer.curtime(),
+            loop = seq.loop,
+            fadeIn = seq.fadeIn,
+            fadeOut = seq.fadeOut,
+            length = seq.length,
+            blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
+            pause = false,
+            weight = 1
         }
     end
 end
@@ -393,8 +427,6 @@ local function updateParameters(ent)
     end
 end
 
-local zero = {Vector(), Angle()}
-
 
 ---@param ent ModelEntity
 local function sequenceThink(ent)
@@ -405,7 +437,10 @@ local function sequenceThink(ent)
     ---@type table<number, BoneMatrix>
     local boneMatrixes = {}
     local boneCount = #modelInfo.bones
-    for _, layer in pairs(ent.layers) do
+    local layers = ent.layers
+    for i=1, 32 do
+        local layer = layers[i]
+        if !layer then goto cont end
         local process = cur - layer.startedAt
         local len = layer.length
         if layer.loop and process >= len then
@@ -413,7 +448,7 @@ local function sequenceThink(ent)
             process = process - len
         end
         local fadeIn = math.clamp(process / layer.fadeIn, 0, 1)
-        local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
+        -- local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
         local weight = fadeIn
         local method = layer.blend
         local anim = layer.frames
@@ -423,6 +458,7 @@ local function sequenceThink(ent)
             local lastMatrix = boneMatrixes[bone]
             boneMatrixes[bone] = method(weight, lastMatrix and lastMatrix or zero, frame)
         end
+        ::cont::
     end
     for bone=1, boneCount do
         local boneEntity = ent.modelBones[bone]
@@ -524,7 +560,32 @@ end
 local function modelMethodsOverride(self, ent)
     ---@cast ent ModelEntity
     ent.modelInfo = self
-    ent.layers = {}
+    if CLIENT then
+        local layers = {}
+        local startId = 17
+        for i=1, #self.sequences do
+            local seq = self.sequences[i]
+            if seq.autoplay then
+                startId = startId + 1
+                if startId > 32 then
+                    throw("Autoplay animations overflow")
+                    return
+                end
+                layers[startId] = {
+                    frames = seq.animation,
+                    startedAt = timer.curtime(),
+                    loop = seq.loop,
+                    fadeIn = seq.fadeIn,
+                    fadeOut = seq.fadeOut,
+                    length = seq.length,
+                    blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
+                    pause = false,
+                    weight = 1
+                }
+            end
+        end
+        ent.layers = layers
+    end
     for name, v in pairs(ModelEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -1084,6 +1145,8 @@ end
 ---@class Sequence
 ---@field animation Animation
 ---@field loop boolean
+---@field autoplay boolean
+---@field delta boolean
 ---@field fadeIn number
 ---@field fadeOut number
 ---@field length number
@@ -1168,6 +1231,10 @@ end
 ---@field [1] number
 ---@field [2] number
 
+---@class ToSubtract
+---@field [1] string Other animation to subtract
+---@field [2] number Frame to subtract
+
 ---@alias Weightlist table<string, number>
 
 ---@class RawKeyframe
@@ -1180,6 +1247,7 @@ end
 ---@field fps number? Frame Per Second. By default is 30
 ---@field frames Range? Frame range
 ---@field weightlist Weightlist? Weightlist of bones
+---@field subtract ToSubtract? Keyframes
 
 
 ---[SHARED] Add animation to model. You can't start animation, but you can use it for sequence
@@ -1201,6 +1269,17 @@ function ModelInfo:addAnimation(name, params)
     local bonesIDs = self.bonesIDs
     local bones = self.bones
     local vectorZero, angleZero = Vector(), Angle()
+    local subtract, subtractFrame
+    if params.subtract then
+        local animName = params.subtract[1]
+        local anim = self.animations[animName]
+        if !anim then
+            throw("No such animation: " .. animName)
+            return
+        end
+        subtract = anim
+        subtractFrame = params.subtract[2]
+    end
     for i=min, max do
         local v = frames[i]
         local frameTime = (i - min) + 1
@@ -1209,11 +1288,12 @@ function ModelInfo:addAnimation(name, params)
             if !boneId then goto cont end
             local weight = weightlist[bone[1]] or 1
             local keyframes = newFrames[boneId] or {}
+            local toSubtract = subtract and subtract[boneId].frames[subtractFrame] or zero
             newFrames[boneId] = keyframes
             local offset = bones[boneId].offset
             keyframes[frameTime] = {
-                math.lerpVector(weight, vectorZero, bone[2] - offset),
-                math.lerpAngle(weight, angleZero, bone[3])
+                math.lerpVector(weight, vectorZero, (bone[2] - offset) - toSubtract[1]),
+                math.lerpAngle(weight, angleZero, (bone[3]) - toSubtract[2])
             }
             ::cont::
         end
@@ -1230,6 +1310,8 @@ end
 ---@class SequenceParameters
 ---@field [1] string Animation
 ---@field loop boolean? Loop animation
+---@field delta boolean? Play this animation as additive
+---@field autoplay boolean? Play this animation at top of other
 ---@field fadeIn number? Fade in
 ---@field fadeOut number? Fade out
 
@@ -1248,7 +1330,9 @@ function ModelInfo:addSequence(name, params)
         length = len,
         fadeIn = params.fadeIn or 0.2,
         fadeOut = params.fadeOut or 0.2,
-        loop = params.loop or false
+        loop = params.loop or false,
+        delta = params.delta or false,
+        autoplay = params.autoplay or false
     }
     return self
 end
