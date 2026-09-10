@@ -53,6 +53,7 @@ end
 ---@field fps number FPS of animation. By default is 30
 ---@field length number Length of animation
 ---@field lastProcess number Last handled process
+---@field weight number Weight of keyframes
 ---@field mat1 BoneMatrix First bone matrix on last process
 ---@field mat2 BoneMatrix Second bone matrix on last process
 local Keyframes = {}
@@ -60,9 +61,10 @@ Keyframes.__index = Keyframes
 
 ---@param frames BoneMatrix[]
 ---@param fps number?
-function Keyframes:new(frames, fps)
+---@param weight number?
+function Keyframes:new(frames, fps, weight)
     return setmetatable(
-        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0},
+        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0, weight = weight or 1},
         Keyframes
     )
 end
@@ -114,7 +116,8 @@ local ANIMBLEND = {
 ---@field loop boolean Loop this layer
 ---@field pause boolean Pause this layer
 ---@field blend ANIMBLEND Blending method
----@field frames Animation Animation to play on this layer
+---@field frames Animation[] Animations to play on this layer
+---@field blendExtended BlendParameters? Blend extended
 ---@field weight number Weight of this layer
 ---@field fadeIn number How long fade this layer in. By default is 0.2
 ---@field fadeOut number How long fade this layer out. By default is 0.2
@@ -240,7 +243,10 @@ function ModelEntity:setSequence(id)
             return
         end
         self.layers[1] = {
-            frames = seq.animation,
+            frames = seq.animations,
+            blendExtended = seq.blend,
+            weightX = 0,
+            weightY = 0,
             startedAt = timer.curtime(),
             loop = seq.loop,
             fadeIn = seq.fadeIn,
@@ -273,7 +279,10 @@ function ModelEntity:addGestureSequence(id, autokill)
             return
         end
         self.layers[layerId] = {
-            frames = seq.animation,
+            frames = seq.animations,
+            blendExtended = seq.blend,
+            weightX = 0,
+            weightY = 0,
             startedAt = timer.curtime(),
             loop = seq.loop,
             fadeIn = seq.fadeIn,
@@ -451,12 +460,66 @@ local function sequenceThink(ent)
         -- local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
         local weight = fadeIn
         local method = layer.blend
-        local anim = layer.frames
+        local blExt = layer.blendExtended
+        local anim
+        local anim1, anim2, anim3, anim4, localWeightX, localWeightY
+        if !blExt then
+            anim = layer.frames[1]
+        else
+            local blendX = blExt.blendX
+            local blendY = blExt.blendY
+            local weightX = blendX and ent:getPose(blendX.name) or 0
+            local weightY = blendY and ent:getPose(blendY.name) or 0
+            local blendwidth = blExt.blendwidth
+            weightX = blendX and math.clamp((weightX - blendX.min) / blExt.rangeX, 0, 1) or 0
+            weightY = blendY and math.clamp((weightY - blendY.min) / blExt.rangeY, 0, 1) or 0
+            local x, y
+            if blExt.centerX then
+                weightX = weightX * 2 - 1
+                weightY = weightY * 2 - 1
+                x = blExt.centerX + (weightX * (weightX > 0 and blExt.distanceRight or blExt.distanceLeft))
+                y = blExt.centerY + (weightY * (weightY > 0 and blExt.distanceDown or blExt.distanceUp))
+            else
+                x = weightX * blendwidth
+                y = weightY * blExt.blendheight
+            end
+
+            local floorX, floorY = math.floor(x), math.floor(y)
+            localWeightX = x - floorX
+            localWeightY = y - floorY
+            local xIndex1 = floorX
+            local xIndex2 = math.ceil(x)
+            local yIndex1 = (floorY - 1) * blendwidth
+            local yIndex2 = (math.ceil(y) - 1) * blendwidth
+
+            local frames = layer.frames
+            anim1 = frames[xIndex1 + yIndex1]
+            anim2 = frames[xIndex2 + yIndex1]
+            anim3 = frames[xIndex1 + yIndex2]
+            anim4 = frames[xIndex2 + yIndex2]
+        end
         for bone=1, boneCount do
-            local keyframes = anim[bone]
-            local frame = keyframes and keyframes:getFrame(process)
+            local frame
+            local boneWeight
+            if anim then
+                local keyframes = anim[bone]
+                if !keyframes then goto cont end
+                frame = keyframes:getFrame(process)
+                boneWeight = keyframes.weight
+            else
+                local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
+                frame = ANIMBLEND.LINEAR(localWeightY,
+                    ANIMBLEND.LINEAR(localWeightX, kf1:getFrame(process), kf2:getFrame(process)),
+                    ANIMBLEND.LINEAR(localWeightX, kf3:getFrame(process), kf4:getFrame(process))
+                )
+                boneWeight = math.lerp(localWeightY,
+                    math.lerp(localWeightX, kf1.weight, kf2.weight),
+                    math.lerp(localWeightY, kf3.weight, kf4.weight)
+                )
+            end
             local lastMatrix = boneMatrixes[bone]
-            boneMatrixes[bone] = method(weight, lastMatrix and lastMatrix or zero, frame)
+            boneMatrixes[bone] = method(weight * boneWeight, lastMatrix and lastMatrix or zero, frame)
+            ::cont::
         end
         ::cont::
     end
@@ -572,7 +635,8 @@ local function modelMethodsOverride(self, ent)
                     return
                 end
                 layers[startId] = {
-                    frames = seq.animation,
+                    frames = seq.animations,
+                    blendExtended = seq.blend,
                     startedAt = timer.curtime(),
                     loop = seq.loop,
                     fadeIn = seq.fadeIn,
@@ -586,6 +650,7 @@ local function modelMethodsOverride(self, ent)
         end
         ent.layers = layers
     end
+    ent.poseParameters = {}
     for name, v in pairs(ModelEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -1141,15 +1206,36 @@ function model.holo(tbl)
     end
 end
 
+---@class PoseParameter
+---@field name string
+---@field min number
+---@field max number
+
+---@class BlendParameters
+---@field centerX number
+---@field centerY number
+---@field blendheight number
+---@field blendwidth number
+---@field blendX PoseParameter
+---@field blendY PoseParameter
+---@field distanceRight number
+---@field distanceDown number
+---@field distanceLeft number
+---@field distanceUp number
+---@field rangeX number
+---@field rangeY number
 
 ---@class Sequence
----@field animation Animation
+---@field animations Animation[]
+---@field blend BlendParameters?
 ---@field loop boolean
 ---@field autoplay boolean
 ---@field delta boolean
 ---@field fadeIn number
 ---@field fadeOut number
 ---@field length number
+local Sequence = {}
+Sequence.__index = Sequence
 
 ---@class Bone
 ---@field parent string
@@ -1235,7 +1321,8 @@ end
 ---@field [1] string Other animation to subtract
 ---@field [2] number Frame to subtract
 
----@alias Weightlist table<string, number>
+---@alias RawWeightlist table<string, number>
+---@alias Weightlist table<number, number>
 
 ---@class RawKeyframe
 ---@field [1] string Name of the bone
@@ -1246,7 +1333,7 @@ end
 ---@field [1] RawKeyframe[][] Keyframes
 ---@field fps number? Frame Per Second. By default is 30
 ---@field frames Range? Frame range
----@field weightlist Weightlist? Weightlist of bones
+---@field weightlist RawWeightlist? Weightlist of bones
 ---@field subtract ToSubtract? Keyframes
 
 
@@ -1263,12 +1350,19 @@ function ModelInfo:addAnimation(name, params)
     else
         min, max = 1, currentCount
     end
-    local weightlist = params.weightlist or {}
+    local bonesIDs = self.bonesIDs
+    local weightlist = {}
+    if params.weightlist then
+        for i, v in pairs(params.weightlist) do
+            local bone = bonesIDs[i]
+            if !bone then goto cont end
+            weightlist[bone] = v
+            ::cont::
+        end
+    end
     ---@type Animation
     local newFrames = {}
-    local bonesIDs = self.bonesIDs
     local bones = self.bones
-    local vectorZero, angleZero = Vector(), Angle()
     local subtract, subtractFrame
     if params.subtract then
         local animName = params.subtract[1]
@@ -1286,21 +1380,20 @@ function ModelInfo:addAnimation(name, params)
         for _, bone in ipairs(v) do
             local boneId = bonesIDs[bone[1]]
             if !boneId then goto cont end
-            local weight = weightlist[bone[1]] or 1
             local keyframes = newFrames[boneId] or {}
             local toSubtract = subtract and subtract[boneId].frames[subtractFrame] or zero
             newFrames[boneId] = keyframes
             local offset = bones[boneId].offset
             keyframes[frameTime] = {
-                math.lerpVector(weight, vectorZero, (bone[2] - offset) - toSubtract[1]),
-                math.lerpAngle(weight, angleZero, (bone[3]) - toSubtract[2])
+                (bone[2] - offset) - toSubtract[1],
+                bone[3] - toSubtract[2]
             }
             ::cont::
         end
     end
     local fps = params.fps
     for i, v in pairs(newFrames) do
-        newFrames[i] = Keyframes:new(v, fps)
+        newFrames[i] = Keyframes:new(v, fps, weightlist[i])
     end
     self.animations[name] = newFrames
     return self
@@ -1308,7 +1401,11 @@ end
 
 
 ---@class SequenceParameters
----@field [1] string Animation
+---@field [1] string[] Animations
+---@field blendCenter number? Center of blending
+---@field blendWidth number? Width of blend. Height will be calculated
+---@field blendX string? Identifier of poseparameter for blending by X
+---@field blendY string? Identifier of poseparameter for blending by Y
 ---@field loop boolean? Loop animation
 ---@field delta boolean? Play this animation as additive
 ---@field autoplay boolean? Play this animation at top of other
@@ -1323,10 +1420,54 @@ end
 function ModelInfo:addSequence(name, params)
     local id = #self.sequences+1
     self.sequencesIDs[name] = id
-    local anim = self.animations[params[1]]
-    local len = anim[1].length / anim[1].fps
+    local animations = {}
+    local len
+    local count = 0
+    for _, v in ipairs(params[1]) do
+        local anim = self.animations[v]
+        if !anim then goto cont end
+        if !len then
+            len = anim[1].length / anim[1].fps
+        end
+        count = count + 1
+        animations[count] = anim
+        ::cont::
+    end
+    local blendX = params.blendX and self.poseParameters[params.blendX]
+    local blendY = params.blendY and self.poseParameters[params.blendY]
+    local centerX, centerY
+    local blendwidth, blendheight
+    local blendcenter = params.blendCenter
+    if blendcenter then
+        centerX = math.ceil(blendcenter / blendheight)
+        centerY = math.ceil(blendcenter / blendwidth)
+    else
+        centerX = 0
+        centerY = 0
+    end
+    if !params.blendWidth then
+        blendwidth = count
+        blendheight = 1
+    else
+        blendwidth = params.blendWidth
+        blendheight = count / blendwidth
+    end
     self.sequences[id] = {
-        animation = anim,
+        animations = animations,
+        blend = (blendX or blendY) and {
+            blendX = blendX,
+            blendY = blendY,
+            blendwidth = blendwidth,
+            blendheight = blendheight,
+            distanceRight = blendwidth - centerX,
+            distanceDown = blendheight - centerY,
+            distanceLeft = centerX - 1,
+            distanceUp = centerY - 1,
+            centerX = centerX,
+            centerY = centerY,
+            rangeX = blendX and (blendX.max - blendX.min),
+            rangeY = blendY and (blendY.max - blendY.min)
+        },
         length = len,
         fadeIn = params.fadeIn or 0.2,
         fadeOut = params.fadeOut or 0.2,
