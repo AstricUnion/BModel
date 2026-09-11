@@ -49,13 +49,10 @@ end
 ---@field [2] Angle
 
 ---@class Keyframes
----@field frames BoneMatrix[] Frames of animation
+---@field frames BoneMatrix[]? Frames of default keyframes
 ---@field fps number FPS of animation. By default is 30
 ---@field length number Length of animation
----@field lastProcess number Last handled process
 ---@field weight number Weight of keyframes
----@field mat1 BoneMatrix First bone matrix on last process
----@field mat2 BoneMatrix Second bone matrix on last process
 local Keyframes = {}
 Keyframes.__index = Keyframes
 
@@ -64,7 +61,7 @@ Keyframes.__index = Keyframes
 ---@param weight number?
 function Keyframes:new(frames, fps, weight)
     return setmetatable(
-        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0, weight = weight or 1},
+        {frames = frames, fps = fps or 30, length = #frames, weight = weight or 1},
         Keyframes
     )
 end
@@ -77,22 +74,14 @@ function Keyframes:getFrame(process)
     local frame = process * self.fps + 1
     process = math.clamp(frame, 1, count)
     local frame1 = math.floor(process)
-    local ratio = process - frame1
-    local matrix1, matrix2
-    if frame1 ~= self.lastProcess then
-        local frame2 = math.ceil(process)
-        matrix1 = self.frames[frame1]
-        matrix2 = self.frames[frame2]
-        self.mat1, self.mat2 = matrix1, matrix2
-        self.lastProcess = frame1
-    else
-        matrix1, matrix2 = self.mat1, self.mat2
-    end
-    return {math.lerpVector(ratio, matrix1[1], matrix2[1]), math.lerpAngle(ratio, matrix1[2], matrix2[2])}
+    local mat = self.frames[frame1]
+    return {mat[1], mat[2]}
 end
 
 
 local zero = {Vector(), Angle()}
+
+local lerpVector, lerpAngle = math.lerpVector, math.lerpAngle
 
 ---@enum ANIMBLEND
 local ANIMBLEND = {
@@ -104,8 +93,8 @@ local ANIMBLEND = {
     end,
     LINEAR = function(weight, mat1, mat2)
         return {
-            weight == 1 and mat2[1] or math.lerpVector(weight, mat1[1], mat2[1]),
-            weight == 1 and mat2[2] or math.lerpAngle(weight, mat1[2], mat2[2])
+            lerpVector(weight, mat1[1], mat2[1]),
+            lerpAngle(weight, mat1[2], mat2[2])
         }
     end,
 }
@@ -116,7 +105,7 @@ local ANIMBLEND = {
 ---@field loop boolean Loop this layer
 ---@field pause boolean Pause this layer
 ---@field blend ANIMBLEND Blending method
----@field frames Animation[] Animations to play on this layer
+---@field frames Animation[][] Animations to play on this layer
 ---@field blendExtended BlendParameters? Blend extended
 ---@field weight number Weight of this layer
 ---@field fadeIn number How long fade this layer in. By default is 0.2
@@ -436,6 +425,7 @@ local function updateParameters(ent)
     end
 end
 
+local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
 
 ---@param ent ModelEntity
 local function sequenceThink(ent)
@@ -456,66 +446,57 @@ local function sequenceThink(ent)
             layer.startedAt = cur
             process = process - len
         end
-        local fadeIn = math.clamp(process / layer.fadeIn, 0, 1)
+        local fadeIn = clamp(process / layer.fadeIn, 0, 1)
         -- local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
         local weight = fadeIn
         local method = layer.blend
         local blExt = layer.blendExtended
         local anim
         local anim1, anim2, anim3, anim4, localWeightX, localWeightY
+        local frames = layer.frames
         if !blExt then
-            anim = layer.frames[1]
+            anim = frames[1][1]
         else
             local blendX = blExt.blendX
             local blendY = blExt.blendY
-            local weightX = blendX and ent:getPose(blendX.name) or 0
-            local weightY = blendY and ent:getPose(blendY.name) or 0
-            local blendwidth = blExt.blendwidth
-            weightX = blendX and math.clamp((weightX - blendX.min) / blExt.rangeX, 0, 1) or 0
-            weightY = blendY and math.clamp((weightY - blendY.min) / blExt.rangeY, 0, 1) or 0
-            local x, y
-            if blExt.centerX then
-                weightX = weightX * 2 - 1
-                weightY = weightY * 2 - 1
-                x = blExt.centerX + (weightX * (weightX > 0 and blExt.distanceRight or blExt.distanceLeft))
-                y = blExt.centerY + (weightY * (weightY > 0 and blExt.distanceDown or blExt.distanceUp))
-            else
-                x = weightX * blendwidth
-                y = weightY * blExt.blendheight
-            end
+            local weightX = blendX and ((ent.poseParameters[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
+            local weightY = blendY and ((ent.poseParameters[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
+            print(weightX, weightY)
+            local dist = blExt.distance
+            local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3]))
+            local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
 
-            local floorX, floorY = math.floor(x), math.floor(y)
+            local floorX, floorY = floor(x), floor(y)
+            local ceilX, ceilY = ceil(x), ceil(y)
             localWeightX = x - floorX
             localWeightY = y - floorY
-            local xIndex1 = floorX
-            local xIndex2 = math.ceil(x)
-            local yIndex1 = (floorY - 1) * blendwidth
-            local yIndex2 = (math.ceil(y) - 1) * blendwidth
-
-            local frames = layer.frames
-            anim1 = frames[xIndex1 + yIndex1]
-            anim2 = frames[xIndex2 + yIndex1]
-            anim3 = frames[xIndex1 + yIndex2]
-            anim4 = frames[xIndex2 + yIndex2]
+            print(localWeightX, localWeightY)
+            anim1 = frames[floorY][floorX]
+            anim2 = frames[floorY][ceilX]
+            anim3 = frames[ceilY][floorX]
+            anim4 = frames[ceilY][ceilX]
         end
+        local getFrame = Keyframes.getFrame
         for bone=1, boneCount do
             local frame
             local boneWeight
             if anim then
                 local keyframes = anim[bone]
                 if !keyframes then goto cont end
-                frame = keyframes:getFrame(process)
                 boneWeight = keyframes.weight
+                frame = getFrame(keyframes, process)
             else
                 local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
-                frame = ANIMBLEND.LINEAR(localWeightY,
-                    ANIMBLEND.LINEAR(localWeightX, kf1:getFrame(process), kf2:getFrame(process)),
-                    ANIMBLEND.LINEAR(localWeightX, kf3:getFrame(process), kf4:getFrame(process))
-                )
-                boneWeight = math.lerp(localWeightY,
-                    math.lerp(localWeightX, kf1.weight, kf2.weight),
-                    math.lerp(localWeightY, kf3.weight, kf4.weight)
-                )
+                if kf1.weight == 0 and kf2.weight == 0 and kf3.weight == 0 and kf4.weight == 0 then
+                    goto cont
+                end
+                local linear = ANIMBLEND.LINEAR
+                local firstRow = linear(localWeightX, getFrame(kf1, process), getFrame(kf2, process))
+                local secondRow = linear(localWeightX, getFrame(kf3, process), getFrame(kf3, process))
+                frame = linear(localWeightY, firstRow, secondRow)
+                local firstRowWeight = kf1.weight == kf2.weight and kf1.weight or lerp(localWeightX, kf1.weight, kf2.weight)
+                local secondRowWeight = kf3.weight == kf4.weight and kf3.weight or lerp(localWeightX, kf3.weight, kf4.weight)
+                boneWeight = firstRowWeight == secondRowWeight and firstRowWeight or lerp(localWeightY, firstRowWeight, secondRowWeight)
             end
             local lastMatrix = boneMatrixes[bone]
             boneMatrixes[bone] = method(weight * boneWeight, lastMatrix and lastMatrix or zero, frame)
@@ -650,7 +631,11 @@ local function modelMethodsOverride(self, ent)
         end
         ent.layers = layers
     end
-    ent.poseParameters = {}
+    local poseParameters = {}
+    for name, _ in pairs(self.poseParameters) do
+        poseParameters[name] = 0
+    end
+    ent.poseParameters = poseParameters
     for name, v in pairs(ModelEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -1211,31 +1196,28 @@ end
 ---@field min number
 ---@field max number
 
+---@class BlendDistance
+---@field [1] number Right distance
+---@field [2] number Down distance
+---@field [3] number Left distance
+---@field [4] number Up distance
+
 ---@class BlendParameters
----@field centerX number
----@field centerY number
----@field blendheight number
----@field blendwidth number
 ---@field blendX PoseParameter
 ---@field blendY PoseParameter
----@field distanceRight number
----@field distanceDown number
----@field distanceLeft number
----@field distanceUp number
+---@field distance BlendDistance
 ---@field rangeX number
 ---@field rangeY number
 
 ---@class Sequence
----@field animations Animation[]
----@field blend BlendParameters?
+---@field animations Animation[][] Animations to blend
+---@field blend BlendParameters? 
 ---@field loop boolean
 ---@field autoplay boolean
 ---@field delta boolean
 ---@field fadeIn number
 ---@field fadeOut number
 ---@field length number
-local Sequence = {}
-Sequence.__index = Sequence
 
 ---@class Bone
 ---@field parent string
@@ -1422,52 +1404,60 @@ function ModelInfo:addSequence(name, params)
     self.sequencesIDs[name] = id
     local animations = {}
     local len
+    local blendheight = 1
     local count = 0
-    for _, v in ipairs(params[1]) do
-        local anim = self.animations[v]
+    local animationsRaw = params[1]
+    local animationCount = #animationsRaw
+    local blendwidth = params.blendWidth or animationCount
+    local row = {}
+    for i=1, animationCount do
+        local anim = self.animations[animationsRaw[i]]
         if !anim then goto cont end
         if !len then
             len = anim[1].length / anim[1].fps
         end
+        if blendwidth and count > blendwidth then
+            blendheight = blendheight + 1
+            animations[blendheight] = row
+            row = {}
+            count = 0
+        end
         count = count + 1
-        animations[count] = anim
+        row[count] = anim
         ::cont::
+    end
+    if next(animations) == nil then
+        animations[1] = row
     end
     local blendX = params.blendX and self.poseParameters[params.blendX]
     local blendY = params.blendY and self.poseParameters[params.blendY]
-    local centerX, centerY
-    local blendwidth, blendheight
-    local blendcenter = params.blendCenter
-    if blendcenter then
-        centerX = math.ceil(blendcenter / blendheight)
-        centerY = math.ceil(blendcenter / blendwidth)
-    else
-        centerX = 0
-        centerY = 0
-    end
-    if !params.blendWidth then
-        blendwidth = count
-        blendheight = 1
-    else
-        blendwidth = params.blendWidth
-        blendheight = count / blendwidth
+    local blend
+    if blendX or blendY and count > 1 then
+        local centerX, centerY
+        local blendcenter = params.blendCenter
+        if blendcenter then
+            centerX = math.ceil(blendcenter / blendheight)
+            centerY = math.ceil(blendcenter / blendwidth)
+        else
+            centerX = 1
+            centerY = 1
+        end
+        blend = {
+            blendX = blendX,
+            blendY = blendY,
+            distance = {
+                blendwidth - centerX,
+                blendheight - centerY,
+                centerX - 1,
+                centerY - 1,
+            },
+            rangeX = blendX and (blendX.max - blendX.min),
+            rangeY = blendY and (blendY.max - blendY.min)
+        }
     end
     self.sequences[id] = {
         animations = animations,
-        blend = (blendX or blendY) and {
-            blendX = blendX,
-            blendY = blendY,
-            blendwidth = blendwidth,
-            blendheight = blendheight,
-            distanceRight = blendwidth - centerX,
-            distanceDown = blendheight - centerY,
-            distanceLeft = centerX - 1,
-            distanceUp = centerY - 1,
-            centerX = centerX,
-            centerY = centerY,
-            rangeX = blendX and (blendX.max - blendX.min),
-            rangeY = blendY and (blendY.max - blendY.min)
-        },
+        blend = blend,
         length = len,
         fadeIn = params.fadeIn or 0.2,
         fadeOut = params.fadeOut or 0.2,
