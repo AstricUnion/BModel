@@ -461,16 +461,13 @@ local function sequenceThink(ent)
             local blendY = blExt.blendY
             local weightX = blendX and ((ent.poseParameters[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
             local weightY = blendY and ((ent.poseParameters[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
-            print(weightX, weightY)
             local dist = blExt.distance
-            local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3]))
+            local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
             local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
-
             local floorX, floorY = floor(x), floor(y)
             local ceilX, ceilY = ceil(x), ceil(y)
             localWeightX = x - floorX
             localWeightY = y - floorY
-            print(localWeightX, localWeightY)
             anim1 = frames[floorY][floorX]
             anim2 = frames[floorY][ceilX]
             anim3 = frames[ceilY][floorX]
@@ -491,9 +488,9 @@ local function sequenceThink(ent)
                     goto cont
                 end
                 local linear = ANIMBLEND.LINEAR
-                local firstRow = linear(localWeightX, getFrame(kf1, process), getFrame(kf2, process))
-                local secondRow = linear(localWeightX, getFrame(kf3, process), getFrame(kf3, process))
-                frame = linear(localWeightY, firstRow, secondRow)
+                local firstCol = linear(localWeightY, getFrame(kf1, process), getFrame(kf3, process))
+                local secondCol = linear(localWeightY, getFrame(kf2, process), getFrame(kf4, process))
+                frame = linear(localWeightX, firstCol, secondCol)
                 local firstRowWeight = kf1.weight == kf2.weight and kf1.weight or lerp(localWeightX, kf1.weight, kf2.weight)
                 local secondRowWeight = kf3.weight == kf4.weight and kf3.weight or lerp(localWeightX, kf3.weight, kf4.weight)
                 boneWeight = firstRowWeight == secondRowWeight and firstRowWeight or lerp(localWeightY, firstRowWeight, secondRowWeight)
@@ -1377,6 +1374,7 @@ function ModelInfo:addAnimation(name, params)
     for i, v in pairs(newFrames) do
         newFrames[i] = Keyframes:new(v, fps, weightlist[i])
     end
+    newFrames.name = name
     self.animations[name] = newFrames
     return self
 end
@@ -1384,7 +1382,7 @@ end
 
 ---@class SequenceParameters
 ---@field [1] string[] Animations
----@field blendCenter number? Center of blending
+---@field blendCenter string? Center of blending
 ---@field blendWidth number? Width of blend. Height will be calculated
 ---@field blendX string? Identifier of poseparameter for blending by X
 ---@field blendY string? Identifier of poseparameter for blending by Y
@@ -1404,26 +1402,33 @@ function ModelInfo:addSequence(name, params)
     self.sequencesIDs[name] = id
     local animations = {}
     local len
-    local blendheight = 1
+    local blendheight = 0
     local count = 0
     local animationsRaw = params[1]
     local animationCount = #animationsRaw
     local blendwidth = params.blendWidth or animationCount
+    local centerX = 1
+    local centerY = 1
     local row = {}
     for i=1, animationCount do
-        local anim = self.animations[animationsRaw[i]]
+        local animName = animationsRaw[i]
+        local anim = self.animations[animName]
         if !anim then goto cont end
         if !len then
             len = anim[1].length / anim[1].fps
         end
-        if blendwidth and count > blendwidth then
+        count = count + 1
+        row[count] = anim
+        if animName == params.blendCenter then
+            centerX = count
+            centerY = blendheight + 1
+        end
+        if blendwidth and count >= blendwidth then
             blendheight = blendheight + 1
             animations[blendheight] = row
             row = {}
             count = 0
         end
-        count = count + 1
-        row[count] = anim
         ::cont::
     end
     if next(animations) == nil then
@@ -1433,15 +1438,6 @@ function ModelInfo:addSequence(name, params)
     local blendY = params.blendY and self.poseParameters[params.blendY]
     local blend
     if blendX or blendY and count > 1 then
-        local centerX, centerY
-        local blendcenter = params.blendCenter
-        if blendcenter then
-            centerX = math.ceil(blendcenter / blendheight)
-            centerY = math.ceil(blendcenter / blendwidth)
-        else
-            centerX = 1
-            centerY = 1
-        end
         blend = {
             blendX = blendX,
             blendY = blendY,
