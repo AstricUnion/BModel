@@ -1006,7 +1006,7 @@ function model.hitbox(tbl)
         -- pr:setNoDraw(!visible)
         pr.buoyancyRatio = buoyancyRatio
         timer.simple(0, function()
-            pr:setRenderMode(RENDERMODE.NONE)
+            if !visible then pr:setRenderMode(RENDERMODE.NONE) end
             if !isValid(phys) then return end
             phys:setMass(mass)
             phys:setMaterial(mat)
