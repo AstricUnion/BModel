@@ -81,23 +81,37 @@ end
 
 local zero = {Vector(), Angle()}
 
-local lerpVector, lerpAngle = math.lerpVector, math.lerpAngle
+local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
+local normalizeAngle = math.normalizeAngle
+
+local function lerpAngleNum(ratio, first, second)
+    return first + normalizeAngle(second - first) * ratio
+end
+
+local function smLerpVector(ratio, first, second)
+    first:setX(lerp(ratio, first.x, second.x))
+    first:setY(lerp(ratio, first.y, second.y))
+    first:setZ(lerp(ratio, first.z, second.z))
+end
+
+local function smLerpAngle(ratio, first, second)
+    first:setP(lerpAngleNum(ratio, first.p, second.p))
+    first:setY(lerpAngleNum(ratio, first.y, second.y))
+    first:setR(lerpAngleNum(ratio, first.r, second.r))
+end
 
 ---@enum ANIMBLEND
 local ANIMBLEND = {
     ADD = function(weight, mat1, mat2)
-        return {
-            mat1[1] + mat2[1],
-            mat1[2] + mat2[2]
-        }
+        mat1[1]:add(mat2[1])
+        mat1[2]:add(mat2[2])
     end,
     LINEAR = function(weight, mat1, mat2)
-        return {
-            lerpVector(weight, mat1[1], mat2[1]),
-            lerpAngle(weight, mat1[2], mat2[2])
-        }
-    end,
+        smLerpVector(weight, mat1[1], mat2[1])
+        smLerpAngle(weight, mat1[2], mat2[2])
+    end
 }
+
 
 ---@class AnimationLayer
 ---@field startedAt number Time this layer started at
@@ -392,40 +406,39 @@ if CLIENT then
 end
 
 local function updateParameters(ent)
-    local col = ent:getColor()
+    local col = ent.getColor(ent)
     if ent.color ~= col then
-        ent:recursiveFun("setColor", col)
+        ent.recursiveFun(ent, "setColor", col)
         ent.color = col
     end
 
-    local mat = ent:getMaterial()
+    local mat = ent.getMaterial(ent)
     if ent.material ~= mat then
-        ent:recursiveFun("setMaterial", mat)
+        ent.recursiveFun(ent, "setMaterial", mat)
         ent.material = mat
     end
 
+    local submats = ent.submaterials
     for i=1, ent.modelInfo.submaterialCount do
-        local submaterial = ent:getSubMaterial(i)
-        if ent.submaterials[i] ~= submaterial then
-            ent:recursiveFun("setSubMaterial", i, mat)
-            ent.submaterials[i] = submaterial
+        local submaterial = ent.getSubMaterial(ent, i)
+        if submats[i] ~= submaterial then
+            ent.recursiveFun(ent, "setSubMaterial", i, mat)
+            submats[i] = submaterial
         end
     end
 
-    local renderFX = ent:getRenderFX()
+    local renderFX = ent.getRenderFX(ent)
     if ent.renderFX ~= renderFX then
-        ent:recursiveFun("setRenderFX", renderFX)
+        ent.recursiveFun(ent, "setRenderFX", renderFX)
         ent.renderFX = renderFX
     end
 
-    local noDraw = ent:getNoDraw()
+    local noDraw = ent.getNoDraw(ent)
     if ent.noDraw ~= noDraw then
-        ent:recursiveFun("setNoDraw", noDraw)
+        ent.recursiveFun(ent, "setNoDraw", noDraw)
         ent.noDraw = noDraw
     end
 end
-
-local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
 
 ---@param ent ModelEntity
 local function sequenceThink(ent)
@@ -437,6 +450,7 @@ local function sequenceThink(ent)
     local boneMatrixes = {}
     local boneCount = #modelInfo.bones
     local layers = ent.layers
+    local pose = ent.poseParameters
     for i=1, 32 do
         local layer = layers[i]
         if !layer then goto cont end
@@ -459,8 +473,8 @@ local function sequenceThink(ent)
         else
             local blendX = blExt.blendX
             local blendY = blExt.blendY
-            local weightX = blendX and ((ent.poseParameters[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
-            local weightY = blendY and ((ent.poseParameters[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
+            local weightX = blendX and ((pose[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
+            local weightY = blendY and ((pose[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
             local dist = blExt.distance
             local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
             local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
@@ -474,7 +488,9 @@ local function sequenceThink(ent)
             anim4 = frames[ceilY][ceilX]
         end
         local getFrame = Keyframes.getFrame
+        local linear = ANIMBLEND.LINEAR
         for bone=1, boneCount do
+            local lastMatrix = boneMatrixes[bone] or {Vector(), Angle()}
             local frame
             local boneWeight
             if anim then
@@ -487,26 +503,29 @@ local function sequenceThink(ent)
                 if kf1.weight == 0 and kf2.weight == 0 and kf3.weight == 0 and kf4.weight == 0 then
                     goto cont
                 end
-                local linear = ANIMBLEND.LINEAR
-                local firstCol = linear(localWeightY, getFrame(kf1, process), getFrame(kf3, process))
-                local secondCol = linear(localWeightY, getFrame(kf2, process), getFrame(kf4, process))
-                frame = linear(localWeightX, firstCol, secondCol)
-                local firstRowWeight = kf1.weight == kf2.weight and kf1.weight or lerp(localWeightX, kf1.weight, kf2.weight)
-                local secondRowWeight = kf3.weight == kf4.weight and kf3.weight or lerp(localWeightX, kf3.weight, kf4.weight)
-                boneWeight = firstRowWeight == secondRowWeight and firstRowWeight or lerp(localWeightY, firstRowWeight, secondRowWeight)
+                local kf1frame = getFrame(kf1, process)
+                local firstCol = {kf1frame[1]:clone(), kf1frame[2]:clone()}
+                local kf2frame = getFrame(kf2, process)
+                local secondCol = {kf2frame[1]:clone(), kf2frame[2]:clone()}
+                linear(localWeightY, firstCol, getFrame(kf3, process))
+                linear(localWeightY, secondCol, getFrame(kf4, process))
+                linear(localWeightX, firstCol, secondCol)
+                local firstRowWeight = lerp(localWeightX, kf1.weight, kf2.weight)
+                local secondRowWeight = lerp(localWeightX, kf3.weight, kf4.weight)
+                boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
             end
-            local lastMatrix = boneMatrixes[bone]
-            boneMatrixes[bone] = method(weight * boneWeight, lastMatrix and lastMatrix or zero, frame)
+            method(weight * boneWeight, lastMatrix, frame)
             ::cont::
         end
         ::cont::
     end
+    local modelBones = ent.modelBones
     for bone=1, boneCount do
-        local boneEntity = ent.modelBones[bone]
+        local boneEntity = modelBones[bone]
         local matrix = boneMatrixes[bone]
         if !matrix then goto cont end
-        boneEntity:setLocalPos(bones[bone].offset + matrix[1])
-        boneEntity:setLocalAngles(matrix[2])
+        boneEntity.setLocalPos(boneEntity, bones[bone].offset + matrix[1])
+        boneEntity.setLocalAngles(boneEntity, matrix[2])
         ::cont::
     end
 end
