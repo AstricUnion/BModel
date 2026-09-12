@@ -104,7 +104,11 @@ end
 local ANIMBLEND = {
     ADD = function(weight, mat1, mat2)
         mat1[1]:add(mat2[1])
-        mat1[2]:add(mat2[2])
+        local ang = mat1[2]
+        local ang2 = mat2[2]
+        ang:setP(ang.p + ang2.p)
+        ang:setY(ang.y + ang2.y)
+        ang:setR(ang.r + ang2.r)
     end,
     LINEAR = function(weight, mat1, mat2)
         smLerpVector(weight, mat1[1], mat2[1])
@@ -490,7 +494,11 @@ local function sequenceThink(ent)
         local getFrame = Keyframes.getFrame
         local linear = ANIMBLEND.LINEAR
         for bone=1, boneCount do
-            local lastMatrix = boneMatrixes[bone] or {Vector(), Angle()}
+            local lastMatrix = boneMatrixes[bone]
+            if !lastMatrix then
+                lastMatrix = {Vector(), Angle()}
+                boneMatrixes[bone] = lastMatrix
+            end
             local frame
             local boneWeight
             if anim then
@@ -513,6 +521,7 @@ local function sequenceThink(ent)
                 local firstRowWeight = lerp(localWeightX, kf1.weight, kf2.weight)
                 local secondRowWeight = lerp(localWeightX, kf3.weight, kf4.weight)
                 boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
+                frame = firstCol
             end
             method(weight * boneWeight, lastMatrix, frame)
             ::cont::
