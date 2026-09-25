@@ -3,6 +3,7 @@
 
 -- Beautiful, but no efficiency
 -- TODO: made method without million functions
+-- something like class with entity parameters saved in table
 
 -- implement client parents for holograms
 if CLIENT then
@@ -44,15 +45,48 @@ if CLIENT then
     end
 end
 
+local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
+
+local function lerpAngleNum(ratio, first, second)
+    return first + (((second - first) + 180) % 360 - 180) * ratio
+end
+
+---@enum ANIMBLEND
+local ANIMBLEND = {
+    ADD = function(weight, mat1, mat2)
+        mat1[1] = mat1[1] + mat2[1]
+        mat1[2] = mat1[2] + mat2[2]
+        mat1[3] = mat1[3] + mat2[3]
+        mat1[4] = mat1[4] + mat2[4]
+        mat1[5] = mat1[5] + mat2[5]
+        mat1[6] = mat1[6] + mat2[6]
+    end,
+    LINEAR = function(weight, mat1, mat2)
+        mat1[1] = lerp(weight, mat1[1], mat2[1])
+        mat1[2] = lerp(weight, mat1[2], mat2[2])
+        mat1[3] = lerp(weight, mat1[3], mat2[3])
+        mat1[4] = lerpAngleNum(weight, mat1[4], mat2[4])
+        mat1[5] = lerpAngleNum(weight, mat1[5], mat2[5])
+        mat1[6] = lerpAngleNum(weight, mat1[6], mat2[6])
+    end
+}
+
 ---@class BoneMatrix
----@field [1] Vector
----@field [2] Angle
+---@field [1] number X
+---@field [2] number Y
+---@field [3] number Z
+---@field [4] number P
+---@field [5] number Y
+---@field [6] number R
 
 ---@class Keyframes
----@field frames BoneMatrix[]? Frames of default keyframes
+---@field frames BoneMatrix[] Frames of animation
 ---@field fps number FPS of animation. By default is 30
 ---@field length number Length of animation
+---@field lastProcess number Last handled process
 ---@field weight number Weight of keyframes
+---@field mat1 BoneMatrix First bone matrix on last process
+---@field mat2 BoneMatrix Second bone matrix on last process
 local Keyframes = {}
 Keyframes.__index = Keyframes
 
@@ -61,70 +95,55 @@ Keyframes.__index = Keyframes
 ---@param weight number?
 function Keyframes:new(frames, fps, weight)
     return setmetatable(
-        {frames = frames, fps = fps or 30, length = #frames, weight = weight or 1},
+        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0, weight = weight or 1},
         Keyframes
     )
 end
 
 function Keyframes:getFrame(process)
     local count = self.length
+    local fr = self.frames
     if count == 1 then
-        return self.frames[1]
+        local matrix1 = fr[1]
+        return {matrix1[1], matrix1[2], matrix1[3], matrix1[4], matrix1[5], matrix1[6]}
     end
     local frame = process * self.fps + 1
-    process = math.clamp(frame, 1, count)
-    local frame1 = math.floor(process)
-    local mat = self.frames[frame1]
-    return {mat[1], mat[2]}
+    process = clamp(frame, 1, count)
+    local frame1 = floor(process)
+    local ratio = process - frame1
+    local matrix1, matrix2
+    local frame2 = ceil(process)
+    matrix1 = fr[frame1]
+    matrix2 = fr[frame2]
+    local result = {matrix1[1], matrix1[2], matrix1[3], matrix1[4], matrix1[5], matrix1[6]}
+    ANIMBLEND.LINEAR(ratio, result, matrix2)
+    return result
 end
 
 
-local zero = {Vector(), Angle()}
+local zero = {0, 0, 0, 0, 0, 0}
 
-local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
-local normalizeAngle = math.normalizeAngle
-
-local function lerpAngleNum(ratio, first, second)
-    return first + normalizeAngle(second - first) * ratio
-end
-
-local function smLerpVector(ratio, first, second)
-    first:setX(lerp(ratio, first.x, second.x))
-    first:setY(lerp(ratio, first.y, second.y))
-    first:setZ(lerp(ratio, first.z, second.z))
-end
-
-local function smLerpAngle(ratio, first, second)
-    first:setP(lerpAngleNum(ratio, first.p, second.p))
-    first:setY(lerpAngleNum(ratio, first.y, second.y))
-    first:setR(lerpAngleNum(ratio, first.r, second.r))
-end
-
----@enum ANIMBLEND
-local ANIMBLEND = {
-    ADD = function(weight, mat1, mat2)
-        mat1[1]:add(mat2[1])
-        local ang = mat1[2]
-        local ang2 = mat2[2]
-        ang:setP(ang.p + ang2.p)
-        ang:setY(ang.y + ang2.y)
-        ang:setR(ang.r + ang2.r)
-    end,
-    LINEAR = function(weight, mat1, mat2)
-        smLerpVector(weight, mat1[1], mat2[1])
-        smLerpAngle(weight, mat1[2], mat2[2])
-    end
+---@enum ANIMSTATE
+local ANIMSTATE = {
+    KILLED = 0,
+    START = 1,
+    PROCESS = 2,
+    ENDING = 3
 }
-
 
 ---@class AnimationLayer
 ---@field startedAt number Time this layer started at
+---@field endingAt number Time this layer started ending at
 ---@field length number Length of animation
 ---@field loop boolean Loop this layer
 ---@field pause boolean Pause this layer
+---@field state ANIMSTATE
 ---@field blend ANIMBLEND Blending method
 ---@field frames Animation[][] Animations to play on this layer
 ---@field blendExtended BlendParameters? Blend extended
+---@field frame1 table<number, BoneMatrix> Last frame
+---@field frame2 table<number, BoneMatrix> Next frame (to interpolate)
+---@field lastCalc number
 ---@field weight number Weight of this layer
 ---@field fadeIn number How long fade this layer in. By default is 0.2
 ---@field fadeOut number How long fade this layer out. By default is 0.2
@@ -163,7 +182,6 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
 ---@field layers AnimationLayer[] [CLIENT] Animation layers
----@field startedAt number? [CLIENT] When animation started
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
 ---@field color Color Color of model entity
 ---@field material string Material of model entity
@@ -239,30 +257,34 @@ function ModelEntity:lookupSequence(name)
     return self.modelInfo.sequencesIDs[name] or -1
 end
 
+local function animLayer(seq)
+    return {
+        frames = seq.animations,
+        blendExtended = seq.blend,
+        startedAt = timer.curtime(),
+        loop = seq.loop,
+        fadeIn = seq.fadeIn,
+        fadeOut = seq.fadeOut,
+        length = seq.length,
+        blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
+        pause = false,
+        state = ANIMSTATE.START,
+        weight = 0
+    }
+end
+
 ---[SHARED] Set sequence for this entity
----@param id number Sequence ID
+---@param id number|string Sequence ID or name
 function ModelEntity:setSequence(id)
     self:sendFunction("setSequence", id)
     if CLIENT then
+        id = isnumber(id) or self.modelInfo.sequencesIDs[id]
         local seq = self.modelInfo.sequences[id]
         if !seq then
-            self.layers[1] = nil
+            self.layers[16] = nil
             return
         end
-        self.layers[1] = {
-            frames = seq.animations,
-            blendExtended = seq.blend,
-            weightX = 0,
-            weightY = 0,
-            startedAt = timer.curtime(),
-            loop = seq.loop,
-            fadeIn = seq.fadeIn,
-            fadeOut = seq.fadeOut,
-            length = seq.length,
-            blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
-            pause = false,
-            weight = 0
-        }
+        self.layers[16] = animLayer(seq)
     end
 end
 
@@ -273,11 +295,16 @@ end
 function ModelEntity:addGestureSequence(id, autokill)
     self:sendFunction("addGestureSequence", id, autokill)
     if CLIENT then
+        id = isnumber(id) or self.modelInfo.sequencesIDs[id]
         local seq = self.modelInfo.sequences[id]
+        if !seq then
+            return
+        end
         local layerId
-        for i=3, 17 do
-            if !self.layers[i] then
-                layerId = i + 1
+        for i=18, 32 do
+            local layer = self.layers[i]
+            if !layer or layer.state == ANIMSTATE.KILLED then
+                layerId = i
                 break
             end
         end
@@ -285,20 +312,7 @@ function ModelEntity:addGestureSequence(id, autokill)
             throw("Gesture layers overflow")
             return
         end
-        self.layers[layerId] = {
-            frames = seq.animations,
-            blendExtended = seq.blend,
-            weightX = 0,
-            weightY = 0,
-            startedAt = timer.curtime(),
-            loop = seq.loop,
-            fadeIn = seq.fadeIn,
-            fadeOut = seq.fadeOut,
-            length = seq.length,
-            blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
-            pause = false,
-            weight = 1
-        }
+        self.layers[layerId] = animLayer(seq)
     end
 end
 
@@ -336,6 +350,34 @@ if CLIENT then
     function ModelEntity:getBoneEntity(id)
         return self.modelBones[id]
     end
+
+    ---[CLIENT] Manipulate bone angles
+    ---@param id number Index of the bone
+    ---@param ang Angle Bone manipulation
+    ---@return BoneEntity?
+    function ModelEntity:manipulateBoneAngles(id, ang)
+        local bone = self.modelBones[id]
+        if !bone then
+            throw("Invalid bone: " .. id)
+            return
+        end
+        bone.angle = ang
+    end
+
+
+    ---[CLIENT] Manipulate bone position
+    ---@param id number Index of the bone
+    ---@param pos Vector Bone manipulation
+    ---@return BoneEntity?
+    function ModelEntity:manipulateBonePosition(id, pos)
+        local bone = self.modelBones[id]
+        if !bone then
+            throw("Invalid bone: " .. id)
+            return
+        end
+        bone.offset = pos
+    end
+
 
     local function vectorToPrefixed(prefix, vec)
         return string.format("\n%s %s %s %s", prefix, vec.x, vec.y, vec.z)
@@ -459,14 +501,37 @@ local function sequenceThink(ent)
         local layer = layers[i]
         if !layer then goto cont end
         local process = cur - layer.startedAt
+        local weight = 1
         local len = layer.length
-        if layer.loop and process >= len then
-            layer.startedAt = cur
-            process = process - len
+        if process >= len then
+            if layer.loop then
+                layer.startedAt = cur
+                layer.state = ANIMSTATE.PROCESS
+                process = process - len
+            else
+                layer.state = ANIMSTATE.ENDING
+            end
         end
-        local fadeIn = clamp(process / layer.fadeIn, 0, 1)
-        -- local fadeOut = 1 - math.clamp((len - process) / layer.fadeOut, 0, 1)
-        local weight = fadeIn
+        if layer.fadeIn or layer.fadeOut then
+            if layer.state == ANIMSTATE.START then
+                weight = clamp(process / layer.fadeIn, 0, 1)
+            end
+            if layer.state == ANIMSTATE.ENDING then
+                local endingAt = layer.endingAt
+                if !endingAt then
+                    endingAt = cur
+                    layer.endingAt = endingAt
+                end
+                local endingProcess = cur - endingAt
+                weight = weight * (1 - clamp(endingProcess / layer.fadeOut, 0, 1))
+                if weight == 0 then
+                    layer.state = ANIMSTATE.KILLED
+                end
+            end
+            if layer.state == ANIMSTATE.KILLED then
+                weight = 0
+            end
+        end
         local method = layer.blend
         local blExt = layer.blendExtended
         local anim
@@ -496,7 +561,7 @@ local function sequenceThink(ent)
         for bone=1, boneCount do
             local lastMatrix = boneMatrixes[bone]
             if !lastMatrix then
-                lastMatrix = {Vector(), Angle()}
+                lastMatrix = {0, 0, 0, 0, 0, 0}
                 boneMatrixes[bone] = lastMatrix
             end
             local frame
@@ -506,20 +571,22 @@ local function sequenceThink(ent)
                 if !keyframes then goto cont end
                 boneWeight = keyframes.weight
                 frame = getFrame(keyframes, process)
-            else
-                local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
-                if kf1.weight == 0 and kf2.weight == 0 and kf3.weight == 0 and kf4.weight == 0 then
+                if keyframes.weight == 0 then
                     goto cont
                 end
-                local kf1frame = getFrame(kf1, process)
-                local firstCol = {kf1frame[1]:clone(), kf1frame[2]:clone()}
-                local kf2frame = getFrame(kf2, process)
-                local secondCol = {kf2frame[1]:clone(), kf2frame[2]:clone()}
+            else
+                local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
+                local weight1, weight2, weight3, weight4 = kf1.weight, kf2.weight, kf3.weight, kf4.weight
+                if weight1 + weight2 + weight3 + weight4 == 0 then
+                    goto cont
+                end
+                local firstCol = getFrame(kf1, process)
+                local secondCol = getFrame(kf2, process)
                 linear(localWeightY, firstCol, getFrame(kf3, process))
                 linear(localWeightY, secondCol, getFrame(kf4, process))
                 linear(localWeightX, firstCol, secondCol)
-                local firstRowWeight = lerp(localWeightX, kf1.weight, kf2.weight)
-                local secondRowWeight = lerp(localWeightX, kf3.weight, kf4.weight)
+                local firstRowWeight = lerp(localWeightX, weight1, weight2)
+                local secondRowWeight = lerp(localWeightX, weight3, weight4)
                 boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
                 frame = firstCol
             end
@@ -531,10 +598,12 @@ local function sequenceThink(ent)
     local modelBones = ent.modelBones
     for bone=1, boneCount do
         local boneEntity = modelBones[bone]
-        local matrix = boneMatrixes[bone]
-        if !matrix then goto cont end
-        boneEntity.setLocalPos(boneEntity, bones[bone].offset + matrix[1])
-        boneEntity.setLocalAngles(boneEntity, matrix[2])
+        local mat = boneMatrixes[bone]
+        if !mat then goto cont end
+        local offset = boneEntity.offset + bones[bone].offset
+        local angle = boneEntity.angle
+        boneEntity.setLocalPos(boneEntity, offset + Vector(mat[1], mat[2], mat[3]))
+        boneEntity.setLocalAngles(boneEntity, angle + Angle(mat[4], mat[5], mat[6]))
         ::cont::
     end
 end
@@ -548,14 +617,11 @@ hook.add("Think", "ModelEntityParameterUpdateBones", function()
     end
 end)
 
----@class Layer
----@field offset Vector
----@field angle Angle
-
 ---@class BoneEntity: Entity
 ---@field identifier string Identifier of bone
----@field layers table<number, Layer> Animation layers
----@field offset Vector Initial offset of bone
+---@field modelBone boolean Is bone entity
+---@field offset Vector
+---@field angle Angle
 local BoneEntity = {}
 
 function BoneEntity:recursiveFun(fun, ...)
@@ -631,12 +697,12 @@ local function modelMethodsOverride(self, ent)
     ent.modelInfo = self
     if CLIENT then
         local layers = {}
-        local startId = 17
+        local startId = 1
         for i=1, #self.sequences do
             local seq = self.sequences[i]
             if seq.autoplay then
                 startId = startId + 1
-                if startId > 32 then
+                if startId > 15 then
                     throw("Autoplay animations overflow")
                     return
                 end
@@ -678,6 +744,8 @@ end
 local function boneMethodsOverride(ent)
     ---@cast ent BoneEntity
     ent.modelBone = true
+    ent.offset = Vector()
+    ent.angle = Angle()
     for name, v in pairs(BoneEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -1074,10 +1142,12 @@ local partCreateHolosCoroutine = coroutine.wrap(function(...)
     while true do
         coroutine.yield()
         local newPartsHolos = {}
-        for _, v in ipairs(model.partsHolos) do
+        local oldPartsHolos = model.partsHolos
+        for i=1, #oldPartsHolos do
+            local v = oldPartsHolos[i]
             do
                 if quotaAverage() > quotaMax() / 4 then
-                    coroutine.yield()
+                    coroutine.wait(0.1)
                 end
                 local holo = v[1]()
                 if !holo then goto cont end
@@ -1115,7 +1185,8 @@ hook.add("Think", "PartCreateHolos", partCreateHolosCoroutine)
 function model.part(tbl)
     return function()
         local parent
-        for _, fn in ipairs(tbl) do
+        for i=1, #tbl do
+            local fn = tbl[i]
             if !parent then
                 parent = fn()
                 goto cont
@@ -1170,6 +1241,7 @@ function model.holo(tbl)
     local meshId = tbl.mesh or tbl[11]
     local meshPart = tbl.meshPart or tbl[12]
     local clips = tbl.clips or tbl[13] or {}
+    local clipNum = #clips
     local cullmode = tbl.cullmode or tbl[14] or 0
     local noColorize = tbl.noColorize or tbl[15]
     local funcToMat
@@ -1202,7 +1274,8 @@ function model.holo(tbl)
         if size then holo:setSize(size) end
         if funcToMat then funcToMat(holo) end
         holo:setColor(color)
-        for i, v in ipairs(clips) do
+        for i=1, clipNum do
+            local v = clips[i]
             holo:setClip(i, true, size and v[1] + size or v[1] * scale, v[2], holo)
         end
         if CLIENT then
@@ -1384,16 +1457,19 @@ function ModelInfo:addAnimation(name, params)
     for i=min, max do
         local v = frames[i]
         local frameTime = (i - min) + 1
-        for _, bone in ipairs(v) do
+        for j=1, #v do
+            local bone = v[j]
             local boneId = bonesIDs[bone[1]]
             if !boneId then goto cont end
             local keyframes = newFrames[boneId] or {}
             local toSubtract = subtract and subtract[boneId].frames[subtractFrame] or zero
             newFrames[boneId] = keyframes
             local offset = bones[boneId].offset
+            local bonePos = (bone[2] - offset) - Vector(toSubtract[1], toSubtract[2], toSubtract[3])
+            local boneAng = bone[3] - Angle(toSubtract[4], toSubtract[5], toSubtract[6])
             keyframes[frameTime] = {
-                (bone[2] - offset) - toSubtract[1],
-                bone[3] - toSubtract[2]
+                bonePos.x, bonePos.y, bonePos.z,
+                boneAng.p, boneAng.y, boneAng.r
             }
             ::cont::
         end
@@ -1515,7 +1591,9 @@ function ModelInfo:create(origin)
     end
     ---@type table<string, Entity>
     local bones = {}
-    for i, part in ipairs(self.bones) do
+    local boneInfos = self.bones
+    for i=1, #boneInfos do
+        local part = boneInfos[i]
         if !part then goto cont end
         local holo = part.bone()
         if !holo then goto cont end
