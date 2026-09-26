@@ -1,6 +1,8 @@
 ---@name Model
 ---@author AstricUnion
 
+local serverToClientAnimCoeff = 3.5
+
 -- Beautiful, but no efficiency
 -- TODO: made method without million functions
 -- something like class with entity parameters saved in table
@@ -45,7 +47,11 @@ if CLIENT then
     end
 end
 
-local floor, ceil, clamp, lerp = math.floor, math.ceil, math.clamp, math.lerp
+local floor, ceil, clamp = math.floor, math.ceil, math.clamp
+
+local function lerp(ratio, first, second)
+    return first + (second - first) * ratio
+end
 
 local function lerpAngleNum(ratio, first, second)
     return first + (((second - first) + 180) % 360 - 180) * ratio
@@ -83,10 +89,7 @@ local ANIMBLEND = {
 ---@field frames BoneMatrix[] Frames of animation
 ---@field fps number FPS of animation. By default is 30
 ---@field length number Length of animation
----@field lastProcess number Last handled process
 ---@field weight number Weight of keyframes
----@field mat1 BoneMatrix First bone matrix on last process
----@field mat2 BoneMatrix Second bone matrix on last process
 local Keyframes = {}
 Keyframes.__index = Keyframes
 
@@ -95,7 +98,7 @@ Keyframes.__index = Keyframes
 ---@param weight number?
 function Keyframes:new(frames, fps, weight)
     return setmetatable(
-        {frames = frames, fps = fps or 30, length = #frames, mat1 = nil, mat2 = nil, lastProcess = 0, weight = weight or 1},
+        {frames = frames, fps = fps or 30, length = #frames, weight = weight or 1},
         Keyframes
     )
 end
@@ -110,13 +113,8 @@ function Keyframes:getFrame(process)
     local frame = process * self.fps + 1
     process = clamp(frame, 1, count)
     local frame1 = floor(process)
-    local ratio = process - frame1
-    local matrix1, matrix2
-    local frame2 = ceil(process)
-    matrix1 = fr[frame1]
-    matrix2 = fr[frame2]
+    local matrix1 = fr[frame1]
     local result = {matrix1[1], matrix1[2], matrix1[3], matrix1[4], matrix1[5], matrix1[6]}
-    ANIMBLEND.LINEAR(ratio, result, matrix2)
     return result
 end
 
@@ -141,9 +139,6 @@ local ANIMSTATE = {
 ---@field blend ANIMBLEND Blending method
 ---@field frames Animation[][] Animations to play on this layer
 ---@field blendExtended BlendParameters? Blend extended
----@field frame1 table<number, BoneMatrix> Last frame
----@field frame2 table<number, BoneMatrix> Next frame (to interpolate)
----@field lastCalc number
 ---@field weight number Weight of this layer
 ---@field fadeIn number How long fade this layer in. By default is 0.2
 ---@field fadeOut number How long fade this layer out. By default is 0.2
@@ -181,6 +176,10 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 ---@class ModelEntity: Entity
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
+---@field lastCalcTime number Last frame calculation ttime
+---@field lastCalcFrame number Last frame calculated
+---@field lastPose table<number, BoneMatrix> Last pose of model
+---@field nextPose table<number, BoneMatrix> Next pose of model
 ---@field layers AnimationLayer[] [CLIENT] Animation layers
 ---@field poseParameters table<string, number> [CLIENT] Pose parameters for this entity
 ---@field color Color Color of model entity
@@ -205,9 +204,10 @@ local function recursiveFun(origin, fun, ...)
 end
 
 function ModelEntity:recursiveFun(fun, ...)
+    local isFun = isfunction(fun)
     for _, v in pairs(CLIENT and self.modelBones or self:getChildren()) do
         if v:getClass() ~= "starfall_hologram" then goto cont end
-        if isfunction(fun) then
+        if isFun then
             fun(v, ...)
         else
             if v[fun] then v[fun](v, ...) end
@@ -452,6 +452,7 @@ if CLIENT then
 end
 
 local function updateParameters(ent)
+    -- todo: one recursive function for all
     local col = ent.getColor(ent)
     if ent.color ~= col then
         ent.recursiveFun(ent, "setColor", col)
@@ -490,120 +491,138 @@ end
 local function sequenceThink(ent)
     if !CLIENT then return end
     local modelInfo = ent.modelInfo
-    local bones = modelInfo.bones
+    local lastThink = floor(game.getTickCount() / serverToClientAnimCoeff)
     local cur = timer.curtime()
+    local bones = modelInfo.bones
     ---@type table<number, BoneMatrix>
-    local boneMatrixes = {}
     local boneCount = #modelInfo.bones
-    local layers = ent.layers
-    local pose = ent.poseParameters
-    for i=1, 32 do
-        local layer = layers[i]
-        if !layer then goto cont end
-        local process = cur - layer.startedAt
-        local weight = 1
-        local len = layer.length
-        if process >= len then
-            if layer.loop then
-                layer.startedAt = cur
-                layer.state = ANIMSTATE.PROCESS
-                process = process - len
+    if lastThink ~= ent.lastCalcFrame then
+        local boneMatrixes = {}
+        ent.lastCalcTime = cur
+        ent.lastCalcFrame = lastThink
+        local layers = ent.layers
+        local pose = ent.poseParameters
+        for i=1, 32 do
+            local layer = layers[i]
+            if !layer then goto cont end
+            local process = cur - layer.startedAt
+            local weight = 1
+            local len = layer.length
+            if process >= len then
+                if layer.loop then
+                    layer.startedAt = cur
+                    layer.state = ANIMSTATE.PROCESS
+                    process = process - len
+                else
+                    layer.state = ANIMSTATE.ENDING
+                end
+            end
+            -- if layer.fadeIn or layer.fadeOut then
+            --     if layer.state == ANIMSTATE.START then
+            --         weight = clamp(process / layer.fadeIn, 0, 1)
+            --     end
+            --     if layer.state == ANIMSTATE.ENDING then
+            --         local endingAt = layer.endingAt
+            --         if !endingAt then
+            --             endingAt = cur
+            --             layer.endingAt = endingAt
+            --         end
+            --         local endingProcess = cur - endingAt
+            --         weight = weight * (1 - clamp(endingProcess / layer.fadeOut, 0, 1))
+            --         if weight == 0 then
+            --             layer.state = ANIMSTATE.KILLED
+            --         end
+            --     end
+            --     if layer.state == ANIMSTATE.KILLED then
+            --         weight = 0
+            --     end
+            -- end
+            local method = layer.blend
+            local blExt = layer.blendExtended
+            local anim
+            local anim1, anim2, anim3, anim4, localWeightX, localWeightY
+            local frames = layer.frames
+            if !blExt then
+                anim = frames[1][1]
             else
-                layer.state = ANIMSTATE.ENDING
+                local blendX = blExt.blendX
+                local blendY = blExt.blendY
+                local weightX = blendX and ((pose[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
+                local weightY = blendY and ((pose[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
+                local dist = blExt.distance
+                local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
+                local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
+                local floorX, floorY = floor(x), floor(y)
+                local ceilX, ceilY = ceil(x), ceil(y)
+                localWeightX = x - floorX
+                localWeightY = y - floorY
+                anim1 = frames[floorY][floorX]
+                anim2 = frames[floorY][ceilX]
+                anim3 = frames[ceilY][floorX]
+                anim4 = frames[ceilY][ceilX]
             end
-        end
-        if layer.fadeIn or layer.fadeOut then
-            if layer.state == ANIMSTATE.START then
-                weight = clamp(process / layer.fadeIn, 0, 1)
-            end
-            if layer.state == ANIMSTATE.ENDING then
-                local endingAt = layer.endingAt
-                if !endingAt then
-                    endingAt = cur
-                    layer.endingAt = endingAt
+            local getFrame = Keyframes.getFrame
+            local linear = ANIMBLEND.LINEAR
+            for bone=1, boneCount do
+                local lastMatrix = boneMatrixes[bone]
+                if !lastMatrix then
+                    lastMatrix = {0, 0, 0, 0, 0, 0}
+                    boneMatrixes[bone] = lastMatrix
                 end
-                local endingProcess = cur - endingAt
-                weight = weight * (1 - clamp(endingProcess / layer.fadeOut, 0, 1))
-                if weight == 0 then
-                    layer.state = ANIMSTATE.KILLED
+                local frame
+                local boneWeight
+                if anim then
+                    local keyframes = anim[bone]
+                    if !keyframes then goto cont end
+                    boneWeight = keyframes.weight
+                    frame = getFrame(keyframes, process)
+                    if keyframes.weight == 0 then
+                        goto cont
+                    end
+                else
+                    local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
+                    local weight1, weight2, weight3, weight4 = kf1.weight, kf2.weight, kf3.weight, kf4.weight
+                    if weight1 + weight2 + weight3 + weight4 == 0 then
+                        goto cont
+                    end
+                    local firstCol = getFrame(kf1, process)
+                    local secondCol = getFrame(kf2, process)
+                    linear(localWeightY, firstCol, getFrame(kf3, process))
+                    linear(localWeightY, secondCol, getFrame(kf4, process))
+                    linear(localWeightX, firstCol, secondCol)
+                    local firstRowWeight = lerp(localWeightX, weight1, weight2)
+                    local secondRowWeight = lerp(localWeightX, weight3, weight4)
+                    boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
+                    frame = firstCol
                 end
+                method(weight * boneWeight, lastMatrix, frame)
+                ::cont::
             end
-            if layer.state == ANIMSTATE.KILLED then
-                weight = 0
-            end
-        end
-        local method = layer.blend
-        local blExt = layer.blendExtended
-        local anim
-        local anim1, anim2, anim3, anim4, localWeightX, localWeightY
-        local frames = layer.frames
-        if !blExt then
-            anim = frames[1][1]
-        else
-            local blendX = blExt.blendX
-            local blendY = blExt.blendY
-            local weightX = blendX and ((pose[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
-            local weightY = blendY and ((pose[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
-            local dist = blExt.distance
-            local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
-            local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
-            local floorX, floorY = floor(x), floor(y)
-            local ceilX, ceilY = ceil(x), ceil(y)
-            localWeightX = x - floorX
-            localWeightY = y - floorY
-            anim1 = frames[floorY][floorX]
-            anim2 = frames[floorY][ceilX]
-            anim3 = frames[ceilY][floorX]
-            anim4 = frames[ceilY][ceilX]
-        end
-        local getFrame = Keyframes.getFrame
-        local linear = ANIMBLEND.LINEAR
-        for bone=1, boneCount do
-            local lastMatrix = boneMatrixes[bone]
-            if !lastMatrix then
-                lastMatrix = {0, 0, 0, 0, 0, 0}
-                boneMatrixes[bone] = lastMatrix
-            end
-            local frame
-            local boneWeight
-            if anim then
-                local keyframes = anim[bone]
-                if !keyframes then goto cont end
-                boneWeight = keyframes.weight
-                frame = getFrame(keyframes, process)
-                if keyframes.weight == 0 then
-                    goto cont
-                end
-            else
-                local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
-                local weight1, weight2, weight3, weight4 = kf1.weight, kf2.weight, kf3.weight, kf4.weight
-                if weight1 + weight2 + weight3 + weight4 == 0 then
-                    goto cont
-                end
-                local firstCol = getFrame(kf1, process)
-                local secondCol = getFrame(kf2, process)
-                linear(localWeightY, firstCol, getFrame(kf3, process))
-                linear(localWeightY, secondCol, getFrame(kf4, process))
-                linear(localWeightX, firstCol, secondCol)
-                local firstRowWeight = lerp(localWeightX, weight1, weight2)
-                local secondRowWeight = lerp(localWeightX, weight3, weight4)
-                boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
-                frame = firstCol
-            end
-            method(weight * boneWeight, lastMatrix, frame)
             ::cont::
         end
-        ::cont::
+        if ent.nextPose then
+            ent.lastPose = ent.nextPose
+        end
+        ent.nextPose = boneMatrixes
     end
+
+    local nextPose = ent.nextPose
+    if !nextPose then return end
+    local lastPose = ent.lastPose
     local modelBones = ent.modelBones
+    local weight = clamp((cur - ent.lastCalcTime) / (game.getTickInterval() * serverToClientAnimCoeff), 0, 1)
     for bone=1, boneCount do
         local boneEntity = modelBones[bone]
-        local mat = boneMatrixes[bone]
-        if !mat then goto cont end
+        local lMat = lastPose[bone]
+        if !lMat then goto cont end
         local offset = boneEntity.offset + bones[bone].offset
         local angle = boneEntity.angle
-        boneEntity.setLocalPos(boneEntity, offset + Vector(mat[1], mat[2], mat[3]))
-        boneEntity.setLocalAngles(boneEntity, angle + Angle(mat[4], mat[5], mat[6]))
+        local mat = {lMat[1], lMat[2], lMat[3], lMat[4], lMat[5], lMat[6]}
+        ANIMBLEND.LINEAR(weight, mat, nextPose[bone])
+        local pos = Vector(offset[1] + mat[1], offset[2] + mat[2], offset[3] + mat[3])
+        local ang = Angle(angle[1] + mat[4], angle[2] + mat[5], angle[3] + mat[6])
+        boneEntity.setLocalPos(boneEntity, pos)
+        boneEntity.setLocalAngles(boneEntity, ang)
         ::cont::
     end
 end
@@ -706,21 +725,17 @@ local function modelMethodsOverride(self, ent)
                     throw("Autoplay animations overflow")
                     return
                 end
-                layers[startId] = {
-                    frames = seq.animations,
-                    blendExtended = seq.blend,
-                    startedAt = timer.curtime(),
-                    loop = seq.loop,
-                    fadeIn = seq.fadeIn,
-                    fadeOut = seq.fadeOut,
-                    length = seq.length,
-                    blend = seq.delta and ANIMBLEND.ADD or ANIMBLEND.LINEAR,
-                    pause = false,
-                    weight = 1
-                }
+                layers[startId] = animLayer(seq)
             end
         end
         ent.layers = layers
+        local lastPose = {}
+        for i=1, #self.bones do
+            lastPose[i] = {0, 0, 0, 0, 0, 0}
+        end
+        ent.lastCalcFrame = game.getTickCount() / serverToClientAnimCoeff
+        ent.lastCalcTime = timer.curtime()
+        ent.lastPose = lastPose
     end
     local poseParameters = {}
     for name, _ in pairs(self.poseParameters) do
