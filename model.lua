@@ -1,14 +1,28 @@
 ---@name Model
 ---@author AstricUnion
 
-local serverToClientAnimCoeff = 3.5
+local globalFPS = 25
+local interp = 1 / globalFPS
 
 -- Beautiful, but no efficiency
 -- TODO: made method without million functions
 -- something like class with entity parameters saved in table
 
+-- TODO: separate in multiple files
+
+local floor, ceil, clamp, normalizeAngle, lerpAngle, holocreate = math.floor, math.ceil, math.clamp, math.normalizeAngle, math.lerpAngle, hologram.create
+local sin, cos, rad = math.sin, math.cos, math.rad
+
+local emptyColor = Color(255, 255, 255, 255)
+local vectorNull = Vector()
+local angleNull = Angle()
+local scaleNull = Vector(1, 1, 1)
+
+local emptyMesh
 -- implement client parents for holograms
 if CLIENT then
+    emptyMesh = mesh.createEmpty()
+
     local setParent = function(self, par)
         if self.parent then
             self.parent.children[self] = nil
@@ -47,16 +61,9 @@ if CLIENT then
     end
 end
 
-local floor, ceil, clamp = math.floor, math.ceil, math.clamp
-
 local function lerp(ratio, first, second)
     return first + (second - first) * ratio
 end
-
-local function lerpAngleNum(ratio, first, second)
-    return first + (((second - first) + 180) % 360 - 180) * ratio
-end
-
 ---@enum ANIMBLEND
 local ANIMBLEND = {
     ADD = function(weight, mat1, mat2)
@@ -71,9 +78,12 @@ local ANIMBLEND = {
         mat1[1] = lerp(weight, mat1[1], mat2[1])
         mat1[2] = lerp(weight, mat1[2], mat2[2])
         mat1[3] = lerp(weight, mat1[3], mat2[3])
-        mat1[4] = lerpAngleNum(weight, mat1[4], mat2[4])
-        mat1[5] = lerpAngleNum(weight, mat1[5], mat2[5])
-        mat1[6] = lerpAngleNum(weight, mat1[6], mat2[6])
+        local ang = lerpAngle(
+            weight,
+            Angle(mat1[4], mat1[5], mat1[6]),
+            Angle(mat2[4], mat2[5], mat2[6])
+        )
+        mat1[4], mat1[5], mat1[6] = ang[1], ang[2], ang[3]
     end
 }
 
@@ -106,16 +116,16 @@ end
 function Keyframes:getFrame(process)
     local count = self.length
     local fr = self.frames
+    local mat1
     if count == 1 then
-        local matrix1 = fr[1]
-        return {matrix1[1], matrix1[2], matrix1[3], matrix1[4], matrix1[5], matrix1[6]}
+        mat1 = fr[1]
+    else
+        local frame = process * self.fps + 1
+        process = clamp(frame, 1, count)
+        local frame1 = ceil(process)
+        mat1 = fr[frame1]
     end
-    local frame = process * self.fps + 1
-    process = clamp(frame, 1, count)
-    local frame1 = floor(process)
-    local matrix1 = fr[frame1]
-    local result = {matrix1[1], matrix1[2], matrix1[3], matrix1[4], matrix1[5], matrix1[6]}
-    return result
+    return {mat1[1], mat1[2], mat1[3], mat1[4], mat1[5], mat1[6], mat1[7]}
 end
 
 
@@ -144,29 +154,28 @@ local ANIMSTATE = {
 ---@field fadeOut number How long fade this layer out. By default is 0.2
 
 ---@class ToNetwork
----@field modelId string Identifier of model
----@field params table[] Global parameters to set (functions to call)
----@field paramsToSend table[] Parameters to set to send at this moment
+---@field [1] string Identifier of model
+---@field [2] number ID of model entity
 
 ---Class to manipulate hologram models with custom meshes and hitboxes
 ---@class model
 ---@field registered table<string, ModelInfo>
 ---@field inited table<number, ModelEntity>
+---@field initedList ModelEntity[]
 ---@field mesh table<string, CMesh> Hashmap with mesh to get
 ---@field meshToLoad CMesh[] List with mesh to load
----@field toNetwork table<number, ToNetwork>
+---@field toNetwork ToNetwork[]
 ---@field networked table<number, ToNetwork>
----@field networking boolean
 ---@field materials table<string, Material>
 local model = {}
 model.registered = {}
 model.inited = {}
+model.initedList = {}
 model.mesh = {}
 model.meshToLoad = {}
 model.materials = {}
 model.toNetwork = {}
 model.networked = {}
-model.networking = false
 model.rigVisible = false
 model.rigModel = "models/editor/axis_helper_thick.mdl"
 
@@ -176,8 +185,9 @@ model.rigModel = "models/editor/axis_helper_thick.mdl"
 ---@class ModelEntity: Entity
 ---@field modelInfo ModelInfo Model info
 ---@field modelBones BoneEntity[] [CLIENT] Model bones entities, by number
+---@field manipulateBones table<number, BoneMatrix> Manipulate bones
+---@field manipulateBonesReset boolean Reset client bone manipulation on next frame
 ---@field lastCalcTime number Last frame calculation ttime
----@field lastCalcFrame number Last frame calculated
 ---@field lastPose table<number, BoneMatrix> Last pose of model
 ---@field nextPose table<number, BoneMatrix> Next pose of model
 ---@field layers AnimationLayer[] [CLIENT] Animation layers
@@ -219,30 +229,6 @@ function ModelEntity:recursiveFun(fun, ...)
     end
 end
 
-function ModelEntity:sendFunction(func, ...)
-    if !SERVER or !self.modelInfo then return end
-    local entId = self:entIndex()
-    local args = {...}
-    local toNetwork = model.toNetwork[entId]
-    if !toNetwork then return end
-    local params = toNetwork.paramsToSend
-    local globalParams = toNetwork.params
-    local tab = {func, args}
-    params[#params+1] = tab
-    globalParams[#globalParams+1] = tab
-    if self.networking then return end
-    self.networking = true
-    timer.simple(0, function()
-        if !isValid(self) then return end
-        net.start("ModelCallFunctions")
-            net.writeTable(params)
-            net.writeEntity(self)
-        net.send(find.allPlayers())
-        table.empty(params)
-        self.networking = false
-    end)
-end
-
 ---[SHARED] Lookup for bone in entity
 ---@param name string Name of the bone
 ---@return number id
@@ -276,10 +262,15 @@ end
 ---[SHARED] Set sequence for this entity
 ---@param id number|string Sequence ID or name
 function ModelEntity:setSequence(id)
-    self:sendFunction("setSequence", id)
-    if CLIENT then
+    if SERVER then
         id = isnumber(id) or self.modelInfo.sequencesIDs[id]
         local seq = self.modelInfo.sequences[id]
+        local last = self.layers[16]
+        if last then
+            last.endingAt = timer.curtime()
+            last.state = ANIMSTATE.ENDING
+            self.layers[17] = last
+        end
         if !seq then
             self.layers[16] = nil
             return
@@ -293,8 +284,7 @@ end
 ---@param autokill boolean? Autokill it when it fully play
 ---@return number? layerId
 function ModelEntity:addGestureSequence(id, autokill)
-    self:sendFunction("addGestureSequence", id, autokill)
-    if CLIENT then
+    if SERVER then
         id = isnumber(id) or self.modelInfo.sequencesIDs[id]
         local seq = self.modelInfo.sequences[id]
         if !seq then
@@ -327,12 +317,107 @@ end
 ---@param name string Name of pose parameter
 ---@param value number Value to set
 function ModelEntity:setPose(name, value)
-    self:sendFunction("setPose", name, value)
-    if CLIENT then
+    if SERVER then
         local param = self.modelInfo.poseParameters[name]
         if !param then return end
-        self.poseParameters[name] = math.clamp(value, param.min, param.max)
+        self.poseParameters[name] = clamp(value, param.min, param.max)
     end
+end
+
+---[SHARED] Get bone matrix
+---@param id number Index of the bone
+---@return VMatrix?
+function ModelEntity:getBoneMatrix(id)
+    if SERVER then
+        local pose = self.lastPose
+        local boneMat = pose[id]
+        if !boneMat then return end
+        return Matrix(
+            Angle(boneMat[4], boneMat[5], boneMat[6]),
+            Vector(boneMat[1], boneMat[2], boneMat[3])
+        )
+    else
+        local bone = self.modelBones[id]
+        if !bone then return end
+        return bone:getMatrix()
+    end
+end
+
+local function getBonePosition(boneInfos, pose, bone)
+    -- todo: made with math
+    local info = boneInfos[bone]
+    local mat = pose[bone]
+    local bonePos, boneAng
+    if mat then
+        local offset = info.offset
+        bonePos, boneAng = Vector(offset[1] + mat[1], offset[2] + mat[2], offset[3] + mat[3]), Angle(mat[4], mat[5], mat[6])
+    else
+        bonePos, boneAng = vector_origin, angle_zero
+    end
+    local localPos, localAng
+    if info.parent then
+        local pos, ang = getBonePosition(boneInfos, pose, info.parent)
+        localPos, localAng = localToWorld(bonePos, boneAng, pos, ang)
+    else
+        localPos, localAng = bonePos, boneAng
+    end
+    return localPos, localAng
+end
+
+---[SHARED] Get bone position and angle (in world)
+---@param id number Index of the bone
+---@return Vector?
+---@return Angle?
+function ModelEntity:getBonePosition(id)
+    if SERVER then
+        local boneInfos = self.modelInfo.bones
+        local boneInfo = boneInfos[id]
+        if !boneInfo then return end
+        local pose = self.lastPose
+        local boneMat = pose[id]
+        if !boneMat then return end
+        local localPos, localAng = getBonePosition(boneInfos, pose, id)
+        return localToWorld(localPos, localAng, self:getPos(), self:getAngles())
+    else
+        local bone = self.modelBones[id]
+        if !bone then return end
+        return bone:getPos(), bone:getAngles()
+    end
+end
+
+---[SHARED] Manipulate bone angles
+---@param id number Index of the bone
+---@param ang Angle Bone manipulation
+---@return BoneEntity?
+function ModelEntity:manipulateBoneAngles(id, ang)
+    local bone = self.modelInfo.bones[id]
+    if !bone then
+        throw("Invalid bone: " .. id)
+        return
+    end
+    local manipulation = self.manipulateBones[id]
+    manipulation[4] = ang[1]
+    manipulation[5] = ang[2]
+    manipulation[6] = ang[3]
+    self.manipulateBonesReset = true
+end
+
+
+---[SHARED] Manipulate bone position
+---@param id number Index of the bone
+---@param pos Vector Bone manipulation
+---@return BoneEntity?
+function ModelEntity:manipulateBonePosition(id, pos)
+    local bone = self.modelBones[id]
+    if !bone then
+        throw("Invalid bone: " .. id)
+        return
+    end
+    local manipulation = self.manipulateBones[id]
+    manipulation[1] = pos[1]
+    manipulation[2] = pos[2]
+    manipulation[3] = pos[3]
+    self.manipulateBonesReset = true
 end
 
 local function multiplyColor(c1, c2)
@@ -350,34 +435,6 @@ if CLIENT then
     function ModelEntity:getBoneEntity(id)
         return self.modelBones[id]
     end
-
-    ---[CLIENT] Manipulate bone angles
-    ---@param id number Index of the bone
-    ---@param ang Angle Bone manipulation
-    ---@return BoneEntity?
-    function ModelEntity:manipulateBoneAngles(id, ang)
-        local bone = self.modelBones[id]
-        if !bone then
-            throw("Invalid bone: " .. id)
-            return
-        end
-        bone.angle = ang
-    end
-
-
-    ---[CLIENT] Manipulate bone position
-    ---@param id number Index of the bone
-    ---@param pos Vector Bone manipulation
-    ---@return BoneEntity?
-    function ModelEntity:manipulateBonePosition(id, pos)
-        local bone = self.modelBones[id]
-        if !bone then
-            throw("Invalid bone: " .. id)
-            return
-        end
-        bone.offset = pos
-    end
-
 
     local function vectorToPrefixed(prefix, vec)
         return string.format("\n%s %s %s %s", prefix, vec.x, vec.y, vec.z)
@@ -487,19 +544,124 @@ local function updateParameters(ent)
     end
 end
 
+local function getBlend(frames, pose, blExt)
+    local blendX = blExt.blendX
+    local blendY = blExt.blendY
+    local weightX = blendX and ((pose[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
+    local weightY = blendY and ((pose[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
+    local dist = blExt.distance
+    local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
+    local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
+    local floorX, floorY = floor(x), floor(y)
+    local ceilX, ceilY = ceil(x), ceil(y)
+    return x - floorX,
+        y - floorY,
+        frames[floorY][floorX],
+        frames[floorY][ceilX],
+        frames[ceilY][floorX],
+        frames[ceilY][ceilX]
+end
+
+
+local linear = ANIMBLEND.LINEAR
+local getFrame = Keyframes.getFrame
+local function blend4Animations(process, bone, localWeightX, localWeightY, anim1, anim2, anim3, anim4)
+    local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
+    local weight1, weight2, weight3, weight4 = kf1.weight, kf2.weight, kf3.weight, kf4.weight
+    local firstRowWeight = lerp(localWeightX, weight1, weight2)
+    local secondRowWeight = lerp(localWeightX, weight3, weight4)
+    local boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
+    if boneWeight <= 0 then return end
+    local firstCol = getFrame(kf1, process)
+    local secondCol = getFrame(kf2, process)
+    linear(localWeightY, firstCol, getFrame(kf3, process))
+    linear(localWeightY, secondCol, getFrame(kf4, process))
+    linear(localWeightX, firstCol, secondCol)
+    local frame = firstCol
+    return boneWeight, frame
+end
+
+if CLIENT then
+    net.receive("ModelAnimationData", function()
+        local resetManipulation = net.readBool()
+        local entId = net.readUInt(16)
+        local ent = entity(entId)
+        if !isValid(ent) or !ent.modelInfo then return end
+        ---@cast ent ModelEntity
+        local mdlInfo = ent.modelInfo
+        local manipulation = ent.manipulateBones
+        local pose = {}
+        for i=1, #mdlInfo.bones do
+            if resetManipulation then
+                manipulation[i] = {0, 0, 0, 0, 0, 0}
+            end
+            local mat = {
+                net.readInt(25) / 1000,
+                net.readInt(25) / 1000,
+                net.readInt(25) / 1000,
+                net.readInt(19) / 1000,
+                net.readInt(19) / 1000,
+                net.readInt(19) / 1000
+            }
+            pose[i] = mat
+        end
+        local cur = timer.curtime()
+        local dur = ent.lastCalcTime and interp - (cur - ent.lastCalcTime) or 0
+        if dur == 0 then
+            ent.lastPose = ent.nextPose or ent.lastPose
+            ent.nextPose = pose
+            ent.lastCalcTime = cur
+        else
+            timer.simple(dur, function()
+                cur = cur + dur
+                if cur == ent.lastCalcTime then return end
+                ent.lastPose = ent.nextPose or ent.lastPose
+                ent.nextPose = pose
+                ent.lastCalcTime = cur
+            end)
+        end
+    end)
+end
+
 ---@param ent ModelEntity
 local function sequenceThink(ent)
-    if !CLIENT then return end
-    local modelInfo = ent.modelInfo
-    local lastThink = floor(game.getTickCount() / serverToClientAnimCoeff)
+    local boneCount = #ent.modelInfo.bones
     local cur = timer.curtime()
-    local bones = modelInfo.bones
-    ---@type table<number, BoneMatrix>
-    local boneCount = #modelInfo.bones
-    if lastThink ~= ent.lastCalcFrame then
+    if CLIENT then
+        local nextPose = ent.nextPose
+        if !nextPose then return end
+        local lastPose = ent.lastPose
+        local modelBones = ent.modelBones
+        local manipulateBones = ent.manipulateBones
+        local weight = clamp((cur - ent.lastCalcTime) / interp, 0, 1)
+        for bone=1, boneCount do
+            local boneEntity = modelBones[bone]
+            local lMat = lastPose[bone]
+            local nMat = nextPose[bone]
+            local manip = manipulateBones[bone]
+            local offset = boneEntity.initialOffset
+            local mat = {lMat[1], lMat[2], lMat[3], lMat[4], lMat[5], lMat[6]}
+            linear(weight, mat, nMat)
+            local pos = Vector(
+                manip[1] + offset[1] + mat[1],
+                manip[2] + offset[2] + mat[2],
+                manip[3] + offset[3] + mat[3]
+            )
+            local ang = Angle(
+                manip[4] + mat[4],
+                manip[5] + mat[5],
+                manip[6] + mat[6]
+            )
+            boneEntity.setLocalPos(boneEntity, pos)
+            boneEntity.setLocalAngles(boneEntity, ang)
+        end
+    else
+        local globalProcess = cur * globalFPS
+        local frame1 = floor(globalProcess)
+        if frame1 <= ent.lastCalcTime then return end
+        ---@type table<number, BoneMatrix>
         local boneMatrixes = {}
-        ent.lastCalcTime = cur
-        ent.lastCalcFrame = lastThink
+        ent.lastCalcTime = frame1
         local layers = ent.layers
         local pose = ent.poseParameters
         for i=1, 32 do
@@ -517,26 +679,23 @@ local function sequenceThink(ent)
                     layer.state = ANIMSTATE.ENDING
                 end
             end
-            -- if layer.fadeIn or layer.fadeOut then
-            --     if layer.state == ANIMSTATE.START then
-            --         weight = clamp(process / layer.fadeIn, 0, 1)
-            --     end
-            --     if layer.state == ANIMSTATE.ENDING then
-            --         local endingAt = layer.endingAt
-            --         if !endingAt then
-            --             endingAt = cur
-            --             layer.endingAt = endingAt
-            --         end
-            --         local endingProcess = cur - endingAt
-            --         weight = weight * (1 - clamp(endingProcess / layer.fadeOut, 0, 1))
-            --         if weight == 0 then
-            --             layer.state = ANIMSTATE.KILLED
-            --         end
-            --     end
-            --     if layer.state == ANIMSTATE.KILLED then
-            --         weight = 0
-            --     end
-            -- end
+            if layer.state == ANIMSTATE.START then
+                weight = clamp(process / layer.fadeIn, 0, 1)
+            elseif layer.state == ANIMSTATE.ENDING then
+                local endingAt = layer.endingAt
+                if !endingAt then
+                    endingAt = cur
+                    layer.endingAt = endingAt
+                end
+                local endingProcess = cur - endingAt
+                weight = weight * (1 - clamp(endingProcess / layer.fadeOut, 0, 1))
+                if weight == 0 then
+                    layer.state = ANIMSTATE.KILLED
+                end
+            elseif layer.state == ANIMSTATE.KILLED then
+                weight = 0
+            end
+            if weight <= 0 then goto cont end
             local method = layer.blend
             local blExt = layer.blendExtended
             local anim
@@ -544,59 +703,33 @@ local function sequenceThink(ent)
             local frames = layer.frames
             if !blExt then
                 anim = frames[1][1]
-            else
-                local blendX = blExt.blendX
-                local blendY = blExt.blendY
-                local weightX = blendX and ((pose[blendX.name] - blendX.min) / blExt.rangeX) * 2 - 1 or 0
-                local weightY = blendY and ((pose[blendY.name] - blendY.min) / blExt.rangeY) * 2 - 1 or 0
-                local dist = blExt.distance
-                local x = dist[3] + (weightX * (weightX > 0 and dist[1] or dist[3])) + 1
-                local y = dist[4] + (weightY * (weightY > 0 and dist[2] or dist[4])) + 1
-                local floorX, floorY = floor(x), floor(y)
-                local ceilX, ceilY = ceil(x), ceil(y)
-                localWeightX = x - floorX
-                localWeightY = y - floorY
-                anim1 = frames[floorY][floorX]
-                anim2 = frames[floorY][ceilX]
-                anim3 = frames[ceilY][floorX]
-                anim4 = frames[ceilY][ceilX]
-            end
-            local getFrame = Keyframes.getFrame
-            local linear = ANIMBLEND.LINEAR
-            for bone=1, boneCount do
-                local lastMatrix = boneMatrixes[bone]
-                if !lastMatrix then
-                    lastMatrix = {0, 0, 0, 0, 0, 0}
-                    boneMatrixes[bone] = lastMatrix
-                end
-                local frame
-                local boneWeight
-                if anim then
+                for bone=1, boneCount do
+                    local lastMatrix = boneMatrixes[bone]
+                    if !lastMatrix then
+                        lastMatrix = {0, 0, 0, 0, 0, 0}
+                        boneMatrixes[bone] = lastMatrix
+                    end
+                    local boneWeight
                     local keyframes = anim[bone]
                     if !keyframes then goto cont end
                     boneWeight = keyframes.weight
-                    frame = getFrame(keyframes, process)
-                    if keyframes.weight == 0 then
-                        goto cont
+                    if boneWeight > 0 then
+                        method(weight * boneWeight, lastMatrix, getFrame(keyframes, process))
                     end
-                else
-                    local kf1, kf2, kf3, kf4 = anim1[bone], anim2[bone], anim3[bone], anim4[bone]
-                    local weight1, weight2, weight3, weight4 = kf1.weight, kf2.weight, kf3.weight, kf4.weight
-                    if weight1 + weight2 + weight3 + weight4 == 0 then
-                        goto cont
-                    end
-                    local firstCol = getFrame(kf1, process)
-                    local secondCol = getFrame(kf2, process)
-                    linear(localWeightY, firstCol, getFrame(kf3, process))
-                    linear(localWeightY, secondCol, getFrame(kf4, process))
-                    linear(localWeightX, firstCol, secondCol)
-                    local firstRowWeight = lerp(localWeightX, weight1, weight2)
-                    local secondRowWeight = lerp(localWeightX, weight3, weight4)
-                    boneWeight = lerp(localWeightY, firstRowWeight, secondRowWeight)
-                    frame = firstCol
                 end
-                method(weight * boneWeight, lastMatrix, frame)
-                ::cont::
+            else
+                localWeightX, localWeightY, anim1, anim2, anim3, anim4 = getBlend(frames, pose, blExt)
+                for bone=1, boneCount do
+                    local lastMatrix = boneMatrixes[bone]
+                    if !lastMatrix then
+                        lastMatrix = {0, 0, 0, 0, 0, 0}
+                        boneMatrixes[bone] = lastMatrix
+                    end
+                    local boneWeight, frame = blend4Animations(process, bone, localWeightX, localWeightY, anim1, anim2, anim3, anim4)
+                    if boneWeight and boneWeight > 0 then
+                        method(weight * boneWeight, lastMatrix, frame)
+                    end
+                end
             end
             ::cont::
         end
@@ -604,43 +737,44 @@ local function sequenceThink(ent)
             ent.lastPose = ent.nextPose
         end
         ent.nextPose = boneMatrixes
-    end
-
-    local nextPose = ent.nextPose
-    if !nextPose then return end
-    local lastPose = ent.lastPose
-    local modelBones = ent.modelBones
-    local weight = clamp((cur - ent.lastCalcTime) / (game.getTickInterval() * serverToClientAnimCoeff), 0, 1)
-    for bone=1, boneCount do
-        local boneEntity = modelBones[bone]
-        local lMat = lastPose[bone]
-        if !lMat then goto cont end
-        local offset = boneEntity.offset + bones[bone].offset
-        local angle = boneEntity.angle
-        local mat = {lMat[1], lMat[2], lMat[3], lMat[4], lMat[5], lMat[6]}
-        ANIMBLEND.LINEAR(weight, mat, nextPose[bone])
-        local pos = Vector(offset[1] + mat[1], offset[2] + mat[2], offset[3] + mat[3])
-        local ang = Angle(angle[1] + mat[4], angle[2] + mat[5], angle[3] + mat[6])
-        boneEntity.setLocalPos(boneEntity, pos)
-        boneEntity.setLocalAngles(boneEntity, ang)
-        ::cont::
+        local manipulation = ent.manipulateBones
+        local reset = ent.manipulateBonesReset
+        if reset then
+            ent.manipulateBonesReset = false
+        end
+        net.start("ModelAnimationData")
+            net.writeBool(reset)
+            net.writeUInt(ent:entIndex(), 16)
+            for bone=1, boneCount do
+                local mat = boneMatrixes[bone]
+                local manip = manipulation[bone]
+                net.writeInt((manip[1] + mat[1]) * 1000, 25)
+                net.writeInt((manip[2] + mat[2]) * 1000, 25)
+                net.writeInt((manip[3] + mat[3]) * 1000, 25)
+                net.writeInt(normalizeAngle(manip[4] + mat[4]) * 1000, 19)
+                net.writeInt(normalizeAngle(manip[5] + mat[5]) * 1000, 19)
+                net.writeInt(normalizeAngle(manip[6] + mat[6]) * 1000, 19)
+            end
+        net.send(nil, true)
+        -- print(net.getBytesLeft())
     end
 end
 
 hook.add("Think", "ModelEntityParameterUpdateBones", function()
-    for _, ent in pairs(model.inited) do
-        if !isValid(ent) then goto cont end
-        updateParameters(ent)
-        sequenceThink(ent)
-        ::cont::
+    local inited = model.initedList
+    for i=1, #inited do
+        local ent = inited[i]
+        if isValid(ent) then
+            updateParameters(ent)
+            sequenceThink(ent)
+        end
     end
 end)
 
 ---@class BoneEntity: Entity
 ---@field identifier string Identifier of bone
 ---@field modelBone boolean Is bone entity
----@field offset Vector
----@field angle Angle
+---@field initialOffset Vector
 local BoneEntity = {}
 
 function BoneEntity:recursiveFun(fun, ...)
@@ -714,7 +848,9 @@ end
 local function modelMethodsOverride(self, ent)
     ---@cast ent ModelEntity
     ent.modelInfo = self
-    if CLIENT then
+    ent.manipulateBonesReset = true
+    local manipulateBones = {}
+    if SERVER then
         local layers = {}
         local startId = 1
         for i=1, #self.sequences do
@@ -728,13 +864,17 @@ local function modelMethodsOverride(self, ent)
                 layers[startId] = animLayer(seq)
             end
         end
+        for i=1, #self.bones do
+            manipulateBones[i] = {0, 0, 0, 0, 0, 0}
+        end
         ent.layers = layers
+        ent.lastCalcTime = timer.curtime()
+    else
         local lastPose = {}
         for i=1, #self.bones do
             lastPose[i] = {0, 0, 0, 0, 0, 0}
+            manipulateBones[i] = {0, 0, 0, 0, 0, 0}
         end
-        ent.lastCalcFrame = game.getTickCount() / serverToClientAnimCoeff
-        ent.lastCalcTime = timer.curtime()
         ent.lastPose = lastPose
     end
     local poseParameters = {}
@@ -742,6 +882,7 @@ local function modelMethodsOverride(self, ent)
         poseParameters[name] = 0
     end
     ent.poseParameters = poseParameters
+    ent.manipulateBones = manipulateBones
     for name, v in pairs(ModelEntity) do
         local old = "__" .. name .. "Old"
         ent[old] = ent[old] or ent[name]
@@ -777,16 +918,26 @@ if SERVER then
     ---[SERVER] Sync holograms to clients
     function model.sync(ply)
         local newToNetwork = {}
-        for id, toNetworkInfo in pairs(model.toNetwork) do
-            local origin = entity(id)
+        local toNetwork = model.toNetwork
+        local len = 0
+        for i=1, #toNetwork do
+            local toNetworkInfo = toNetwork[i]
+            local origin = entity(toNetworkInfo[2])
             if !isValid(origin) then goto cont end
+            local id = #newToNetwork+1
             newToNetwork[id] = toNetworkInfo
+            len = id
             ::cont::
         end
         model.toNetwork = newToNetwork
         net.start("NetworkModels")
-            net.writeTable(model.toNetwork)
-        net.send(ply or find.allPlayers())
+            net.writeUInt(len, 16)
+            for i=1, len do
+                local toNetworkInfo = newToNetwork[i]
+                net.writeString(toNetworkInfo[1])
+                net.writeUInt(toNetworkInfo[2], 16)
+            end
+        net.send(ply)
     end
 
     hook.add("ClientInitialized", "InitializeModels", function(ply)
@@ -836,16 +987,21 @@ else
     local meshLoadCoroutine = coroutine.wrap(function()
         while true do
             coroutine.yield()
+            local meshToLoad = model.meshToLoad
+            if next(meshToLoad) == nil then goto cont end
             local newToLoad = {}
-            for _, v in ipairs(model.meshToLoad) do
+            for i=1, #meshToLoad do
+                local v = meshToLoad[i]
                 do
                     if v.mesh then goto cont end
                     if !v.data then goto cont end
                     v.mesh = mesh.createFromObj(v.data, true)
-                    for _, pretendent in ipairs(v.pretendsToIt) do
-                        if !isValid(pretendent.holo) then goto cont end
-                        v:setTo(pretendent.holo, pretendent.part)
-                        ::cont::
+                    local pretendents = v.pretendsToIt
+                    for j=1, #pretendents do
+                        local pretendent = pretendents[j]
+                        if isValid(pretendent.holo) then
+                            v:setTo(pretendent.holo, pretendent.part)
+                        end
                     end
                     v.pretendsToIt = {}
                     goto cont1
@@ -855,14 +1011,13 @@ else
                 ::cont1::
             end
             model.meshToLoad = newToLoad
+            ::cont::
         end
     end)
 
-    local emptyMesh = mesh.createEmpty()
-
     local function createAfterNetworking(ent, toNetworkInfo)
         if !isValid(ent) or ent.modelBones or !toNetworkInfo then return end
-        local mdl = model.registered[toNetworkInfo.modelId]
+        local mdl = model.registered[toNetworkInfo[1]]
         if !mdl then return end
         local class = ent:getClass()
         if (class == "starfall_prop" or class == "starfall_hologram") and ent:getRenderMode() == RENDERMODE.NONE then
@@ -871,19 +1026,22 @@ else
         end
         mdl:create(ent)
         modelMethodsOverride(mdl, ent)
-        for _, funcTable in ipairs(toNetworkInfo.params) do
-            if !ent[funcTable[1]] then goto cont end
-            ent[funcTable[1]](ent, unpack(funcTable[2]))
-            ::cont::
-        end
     end
 
     net.receive("NetworkModels", function()
-        model.networked = net.readTable()
-        for id, toNetworkInfo in pairs(model.networked) do
-            local ent = entity(id)
-            createAfterNetworking(ent, toNetworkInfo)
+        local len = net.readUInt(16)
+        local networked = {}
+        for _=1, len do
+            local id = net.readString()
+            local entId = net.readUInt(16)
+            local toNetworkInfo = {id, entId}
+            local ent = entity(entId)
+            if isValid(ent) then
+                createAfterNetworking(ent, toNetworkInfo)
+            end
+            networked[entId] = toNetworkInfo
         end
+        model.networked = networked
     end)
 
     hook.add("Think", "CustomMeshLoad", function()
@@ -891,7 +1049,7 @@ else
             local maxQuota = quotaMax() / 4
             local currentQuota = quotaAverage()
             if currentQuota > maxQuota then return end
-            for _=1, math.floor(maxQuota / currentQuota) do
+            for _=1, floor(maxQuota / currentQuota) do
                 meshLoadCoroutine()
             end
         end
@@ -992,10 +1150,16 @@ function model.rig(pos, ang)
     ang = ang or Angle()
     return function()
         if !hologram.canSpawn() then return end
-        local holo = hologram.create(pos, ang, model.rigModel, rigScale)
+        local holo = holocreate(pos, ang, model.rigModel, rigScale)
         if !holo then return end
         holo:suppressEngineLighting(true)
-        holo:setNoDraw(!model.rigVisible)
+        if !model.rigVisible then
+            if CLIENT then
+                holo:setMesh(emptyMesh)
+            else
+                holo:setNoDraw(false)
+            end
+        end
         holo.modelRig = true
         return holo
     end
@@ -1005,9 +1169,9 @@ local polygons = 32
 
 local cylinder = {}
 for i=1,polygons do
-    local ang = math.rad((360 / polygons) * i)
-    local x = math.cos(ang)
-    local y = math.sin(ang)
+    local ang = rad((360 / polygons) * i)
+    local x = cos(ang)
+    local y = sin(ang)
     cylinder[#cylinder+1] = Vector(x, y, 1)
     cylinder[#cylinder+1] = Vector(x, y, -1)
 end
@@ -1041,21 +1205,21 @@ local rotMat = {
     x = function(a)
         return {
             Vector(1, 0, 0),
-            Vector(0, math.cos(a), -math.sin(a)),
-            Vector(0, math.sin(a), math.cos(a)),
+            Vector(0, cos(a), -sin(a)),
+            Vector(0, sin(a), cos(a)),
         }
     end,
     y = function(a)
         return {
-            Vector(math.cos(a), 0, math.sin(a)),
+            Vector(cos(a), 0, sin(a)),
             Vector(0, 1, 0),
-            Vector(-math.sin(a), 0, math.cos(a)),
+            Vector(-sin(a), 0, cos(a)),
         }
     end,
     z = function(a)
         return {
-            Vector(math.cos(a), -math.sin(a), 0),
-            Vector(math.sin(a), math.cos(a), 0),
+            Vector(cos(a), -sin(a), 0),
+            Vector(sin(a), cos(a), 0),
             Vector(0, 0, 1),
         }
     end
@@ -1072,9 +1236,9 @@ function model.vertex(tbl)
     local byType = VertexType[type]
     local vertices = byType and table.copy(byType) or tbl.vertices or tbl[5]
     local mats = {
-        x = rotMat.x(math.rad(angle.p)),
-        y = rotMat.y(math.rad(angle.y)),
-        z = rotMat.z(math.rad(angle.r)),
+        x = rotMat.x(rad(angle.p)),
+        y = rotMat.y(rad(angle.y)),
+        z = rotMat.z(rad(angle.r)),
     }
     for vId, v in ipairs(vertices) do
         local pos = v * scale
@@ -1151,6 +1315,26 @@ if SERVER then
     end)
 end
 
+local function createPart(holoFun, origin)
+    local holo = holoFun()
+    if !holo then return end
+    local offset = holo:getLocalPos()
+    local ang = holo:getLocalAngles()
+    local initCol = holo.modelInitialColor
+    if initCol then
+        local col = origin:getColor()
+        holo:setColor(Color(
+            multiplyColor(initCol[1], col[1]),
+            multiplyColor(initCol[2], col[2]),
+            multiplyColor(initCol[3], col[3]),
+            col[4]
+        ))
+    end
+    holo:setNoDraw(origin:getNoDraw())
+    holo:setParent(origin)
+    holo:setLocalPos(offset)
+    holo:setLocalAngles(ang)
+end
 
 model.partsHolos = {}
 local partCreateHolosCoroutine = coroutine.wrap(function(...)
@@ -1164,24 +1348,8 @@ local partCreateHolosCoroutine = coroutine.wrap(function(...)
                 if quotaAverage() > quotaMax() / 4 then
                     coroutine.wait(0.1)
                 end
-                local holo = v[1]()
-                if !holo then goto cont end
-                local offset = holo:getLocalPos()
-                local ang = holo:getLocalAngles()
-                local initCol = holo.modelInitialColor
-                if initCol then
-                    local col = v[2]:getColor()
-                    holo:setColor(Color(
-                        multiplyColor(initCol[1], col[1]),
-                        multiplyColor(initCol[2], col[2]),
-                        multiplyColor(initCol[3], col[3]),
-                        col[4]
-                    ))
-                end
-                holo:setNoDraw(v[2]:getNoDraw())
-                holo:setParent(v[2])
-                holo:setLocalPos(offset)
-                holo:setLocalAngles(ang)
+                if !v[2] then goto cont end
+                createPart(v[1], v[2])
                 goto cont1
             end
             ::cont::
@@ -1196,8 +1364,9 @@ hook.add("Think", "PartCreateHolos", partCreateHolosCoroutine)
 
 ---[SHARED] Create new part - sequence of holos, parented to first in sequence
 ---@param tbl modelfun[]
+---@param createNow boolean Don't wait for creation and create projectiles now
 ---@return modelfun
-function model.part(tbl)
+function model.part(tbl, createNow)
     return function()
         local parent
         for i=1, #tbl do
@@ -1206,7 +1375,11 @@ function model.part(tbl)
                 parent = fn()
                 goto cont
             end
-            model.partsHolos[#model.partsHolos+1] = {fn, parent}
+            if createNow then
+                model.partsHolos[#model.partsHolos+1] = {fn, parent}
+            else
+                createPart(fn, parent)
+            end
             ::cont::
         end
         return parent
@@ -1233,11 +1406,6 @@ end
 ---@field clips Clip[]? Clips of holo
 ---@field cullmode number? Cull mode of holo
 ---@field noColorize boolean? No colorize this holo when changing color with setColor, default false
-
-local emptyColor = Color(255, 255, 255, 255)
-local vectorNull = Vector()
-local angleNull = Angle()
-local scaleNull = Vector(1, 1, 1)
 
 ---[SHARED] Create hologram with extended parameters. On server does nothing
 ---@param tbl HoloParameters
@@ -1282,7 +1450,7 @@ function model.holo(tbl)
     end
     return function()
         if !hologram.canSpawn() then return end
-        local holo = hologram.create(pos, ang, mdl, scale)
+        local holo = holocreate(pos, ang, mdl, scale)
         if !holo then return end
         holo:suppressEngineLighting(noLight)
         holo:setCullMode(cullmode)
@@ -1333,7 +1501,7 @@ end
 ---@field length number
 
 ---@class Bone
----@field parent string
+---@field parent number?
 ---@field bone modelfun
 ---@field name string
 ---@field offset Vector
@@ -1384,9 +1552,17 @@ end
 ---@return ModelInfo
 function ModelInfo:add(bone, offset, mdl, parent)
     local id = #self.bones+1
+    local parentId
+    if parent then
+        parentId = self.bonesIDs[parent]
+        if !parentId then
+            throw(string.format("Parent \"%s\" for \"%s\" not found! Maybe you placed it in incorrect sequence?", parent, bone))
+            return
+        end
+    end
     self.bones[id] = {
         name = bone,
-        parent = parent,
+        parent = parentId,
         bone = mdl,
         offset = offset
     }
@@ -1484,7 +1660,7 @@ function ModelInfo:addAnimation(name, params)
             local boneAng = bone[3] - Angle(toSubtract[4], toSubtract[5], toSubtract[6])
             keyframes[frameTime] = {
                 bonePos.x, bonePos.y, bonePos.z,
-                boneAng.p, boneAng.y, boneAng.r
+                normalizeAngle(boneAng.p), normalizeAngle(boneAng.y), normalizeAngle(boneAng.r)
             }
             ::cont::
         end
@@ -1593,43 +1769,44 @@ function ModelInfo:create(origin)
         return
     end
     local id = originHolo:entIndex()
+    originHolo = modelMethodsOverride(self, originHolo)
     if SERVER then
-        model.toNetwork[id] = {
-            modelId = self.identifier,
-            params = {},
-            paramsToSend = {}
-        }
+        local toNetwork = model.toNetwork
+        toNetwork[#toNetwork+1] = {self.identifier, id}
         model.sync()
-        originHolo = modelMethodsOverride(self, originHolo)
-        model.inited[id] = originHolo
-        return originHolo
-    end
-    ---@type table<string, Entity>
-    local bones = {}
-    local boneInfos = self.bones
-    for i=1, #boneInfos do
-        local part = boneInfos[i]
-        if !part then goto cont end
-        local holo = part.bone()
-        if !holo then goto cont end
-        holo.identifier = part.name
-        boneMethodsOverride(holo)
-        bones[i] = holo
-        local parent = part.parent
-        local parentHolo = bones[self.bonesIDs[parent]] or (!parent and originHolo)
-        if !parentHolo then
-            throw(string.format("Parent \"%s\" for \"%s\" not found! Maybe you placed it in incorrect sequence?", parent, part.name))
-            return
+    else
+        local bones = {}
+        local boneInfos = self.bones
+        for i=1, #boneInfos do
+            local part = boneInfos[i]
+            if !part then goto cont end
+            local holo = part.bone()
+            if !holo then goto cont end
+            holo = boneMethodsOverride(holo)
+            holo.identifier = part.name
+            holo.initialOffset = part.offset
+            bones[i] = holo
+            local parent = part.parent
+            local parentHolo = parent and bones[parent] or originHolo
+            holo:setParent(parentHolo)
+            holo:setLocalPos(part.offset)
+            ::cont::
         end
-        local pos, ang = localToWorld(holo:getPos(), holo:getAngles(), parentHolo:getPos(), parentHolo:getAngles())
-        holo:setPos(pos)
-        holo:setAngles(ang)
-        holo:setParent(parentHolo)
+        originHolo.modelBones = bones
+    end
+    model.inited[id] = originHolo
+    local newList = {}
+    local initedList = model.initedList
+    local len = 0
+    for i=1, #initedList do
+        local modelEnt = initedList[i]
+        if !isValid(modelEnt) then goto cont end
+        len = #newList+1
+        newList[len] = modelEnt
         ::cont::
     end
-    originHolo = modelMethodsOverride(self, originHolo)
-    originHolo.modelBones = bones
-    model.inited[id] = originHolo
+    newList[len+1] = originHolo
+    model.initedList = newList
     return originHolo
 end
 
