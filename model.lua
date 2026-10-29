@@ -64,27 +64,32 @@ end
 local function lerp(ratio, first, second)
     return first + (second - first) * ratio
 end
+
+local function linearBlend(weight, mat1, mat2)
+    mat1[1] = lerp(weight, mat1[1], mat2[1])
+    mat1[2] = lerp(weight, mat1[2], mat2[2])
+    mat1[3] = lerp(weight, mat1[3], mat2[3])
+    local ang = lerpAngle(
+        weight,
+        Angle(mat1[4], mat1[5], mat1[6]),
+        Angle(mat2[4], mat2[5], mat2[6])
+    )
+    mat1[4], mat1[5], mat1[6] = ang[1], ang[2], ang[3]
+end
+
 ---@enum ANIMBLEND
 local ANIMBLEND = {
     ADD = function(weight, mat1, mat2)
-        mat1[1] = mat1[1] + mat2[1]
-        mat1[2] = mat1[2] + mat2[2]
-        mat1[3] = mat1[3] + mat2[3]
-        mat1[4] = mat1[4] + mat2[4]
-        mat1[5] = mat1[5] + mat2[5]
-        mat1[6] = mat1[6] + mat2[6]
+        local matToAdd = {0, 0, 0, 0, 0, 0}
+        linearBlend(weight, matToAdd, mat2)
+        mat1[1] = mat1[1] + matToAdd[1]
+        mat1[2] = mat1[2] + matToAdd[2]
+        mat1[3] = mat1[3] + matToAdd[3]
+        mat1[4] = mat1[4] + matToAdd[4]
+        mat1[5] = mat1[5] + matToAdd[5]
+        mat1[6] = mat1[6] + matToAdd[6]
     end,
-    LINEAR = function(weight, mat1, mat2)
-        mat1[1] = lerp(weight, mat1[1], mat2[1])
-        mat1[2] = lerp(weight, mat1[2], mat2[2])
-        mat1[3] = lerp(weight, mat1[3], mat2[3])
-        local ang = lerpAngle(
-            weight,
-            Angle(mat1[4], mat1[5], mat1[6]),
-            Angle(mat2[4], mat2[5], mat2[6])
-        )
-        mat1[4], mat1[5], mat1[6] = ang[1], ang[2], ang[3]
-    end
+    LINEAR = linearBlend
 }
 
 ---@class BoneMatrix
@@ -266,7 +271,7 @@ function ModelEntity:setSequence(id)
         id = isnumber(id) or self.modelInfo.sequencesIDs[id]
         local seq = self.modelInfo.sequences[id]
         local last = self.layers[16]
-        if last then
+        if last and seq.fadeIn ~= 0 and last.fadeOut ~= 0 then
             last.endingAt = timer.curtime()
             last.state = ANIMSTATE.ENDING
             self.layers[17] = last
@@ -613,7 +618,7 @@ if CLIENT then
             ent.lastCalcTime = cur
         else
             timer.simple(dur, function()
-                cur = cur + dur
+                cur = timer.curtime()
                 if cur == ent.lastCalcTime then return end
                 ent.lastPose = ent.nextPose or ent.lastPose
                 ent.nextPose = pose
@@ -673,7 +678,7 @@ local function sequenceThink(ent)
             if process >= len then
                 if layer.loop then
                     layer.startedAt = cur
-                    layer.state = ANIMSTATE.PROCESS
+                    layer.state = layer.state == ANIMSTATE.START and ANIMSTATE.PROCESS or layer.state
                     process = process - len
                 else
                     layer.state = ANIMSTATE.ENDING
